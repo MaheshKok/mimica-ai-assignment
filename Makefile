@@ -6,7 +6,7 @@
 help:  ## Show this help.
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-install: sync hooks  ## Install deps and pre-commit hooks.
+install: sync  ## Install dependencies (evaluator entry point).
 
 sync:  ## Resolve and install dependencies via uv.
 	uv sync --all-groups
@@ -34,8 +34,13 @@ format:  ## Auto-fix with ruff.
 typecheck:  ## Run mypy.
 	uv run mypy
 
-hooks:  ## Install pre-commit hooks into the repo.
-	uv run pre-commit install
+hooks:  ## (Contributors only) Install pre-commit hooks. No-op if .git is absent.
+	@if [ -d .git ]; then \
+		uv run pre-commit install; \
+	else \
+		echo "No .git directory found - skipping pre-commit install."; \
+		echo "This target is for contributors working in a cloned repo, not evaluators running from a zip."; \
+	fi
 
 clean:  ## Remove caches and build artefacts.
 	rm -rf .pytest_cache .ruff_cache .mypy_cache .coverage htmlcov build dist *.egg-info

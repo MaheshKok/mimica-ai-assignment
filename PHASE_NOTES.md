@@ -72,7 +72,29 @@ Complete. Gate satisfied: `make install && make test` both exit 0 on a clean che
 
 ### Deviations from `plan.md`
 
-None — Phase 1 shipped exactly as specified. The coverage threshold (93%)
-and the expanded flake8 plugin suite came from the current implementation
-request on top of the plan; both are configured via `pyproject.toml` and
-`.flake8` and enforced through pre-commit.
+Phase 1 shipped several quality additions beyond what `plan.md` §Phase 1
+specified. These were intentional, driven by explicit user requirements at
+implementation time, and are logged here for audit:
+
+| Addition | Why | Relation to plan |
+|---|---|---|
+| `pre-commit-config.yaml` with 11 hooks | User requested pre-commit hooks | plan.md §Phase 1 CUT listed pre-commit; user override takes precedence |
+| `uv.lock` checked in | Result of `uv sync`, reproducible installs | plan.md §Phase 1 CUT listed lock files; lock produced automatically |
+| `fail_under = 93` coverage gate | User required 93% coverage | plan.md only required tests to run |
+| Flake8 plugin suite (bugbear, comprehensions, simplify, docstrings, annotations, pytest-style, type-checking, pep8-naming) | User requested "flake8 (all variations)" | plan.md only required flake8 via pre-commit |
+| `mypy` strict on `app/` and `mock_services/` | User required type hints on every function | plan.md didn't specify the typechecker |
+| Expanded Make targets (`test-cov`, `format`, `typecheck`, `hooks`) | Support the additional lint/type/coverage stack | plan.md listed `install run run-mocks test lint clean` |
+
+After the first critique round, one fix was applied post-commit: `make
+install` no longer depends on `make hooks`. An evaluator unzipping the
+submission will not have a `.git` directory, so installing pre-commit
+would have failed. `make hooks` is now a contributor-only target that
+no-ops when `.git` is absent.
+
+### Acknowledged but not acted on
+
+- `fail_under = 93` is aggressive for early phases with few modules.
+  Tracked here because it may need a temporary relaxation if Phase 2/3
+  produces modules whose full test coverage lands in Phase 8. Current
+  mitigation: `make test` does *not* enforce coverage (only `make test-cov`
+  does), so the tight suite doesn't become a dev-loop friction point.
