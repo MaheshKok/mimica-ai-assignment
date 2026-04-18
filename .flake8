@@ -8,6 +8,8 @@ docstring-convention = google
 per-file-ignores =
     tests/*:D100,D101,D102,D103,D104,ANN001,ANN201
     mock_services/*:D100,D104
+    app/core/errors.py:B042
+    app/api/schemas.py:TC003
 exclude =
     .git,
     .venv,

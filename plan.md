@@ -58,7 +58,7 @@ The idea is to lock every interface in code before anything starts calling it. O
 - `app/core/errors.py` — port-level exception hierarchy used by adapters and handled by the orchestrator:
   - `StorageFetchError(image_id: str, cause: Exception)` — single-image fetch failure (404, timeout, 5xx).
   - `WorkflowUpstreamError(cause: Exception)` — stream or qa_answer failure.
-  - `PartialFailureThresholdExceeded(failed: int, total: int)` — raised by the orchestrator when `>MAX_FETCH_FAILURE_RATIO` fetches fail.
+  - `PartialFailureThresholdExceededError(failed: int, total: int)` — raised by the orchestrator when `>MAX_FETCH_FAILURE_RATIO` fetches fail.
 - `app/api/schemas.py` — the wire schemas live here, not in `core`. This matches `architect.md` §13 and keeps Pydantic out of the domain types:
   - `EnrichedQARequest` with `from_: int = Field(alias="from", ge=0)`, `to: int = Field(ge=0)`, `project_id: UUID`, `question: Annotated[str, Field(min_length=1, max_length=1024)]`, `model_validator(mode="after")` enforcing `from_ < to`. `model_config = ConfigDict(populate_by_name=True)` so both `from` and `from_` work.
   - `EnrichedQAResponse` with `answer: str` and `meta: Meta`.
@@ -96,7 +96,7 @@ This is the most important phase. The moment this works, the architecture is pro
   - `async def run(req: EnrichedQARequest, ports: Ports, config: Config, request_id: str) -> EnrichedQAResponse`. `request_id` is passed in, not generated here — the handler owns it so the same value appears in logs, spans, and `Meta` in Phase 7.
   - **Stream handling** — consume `ports.workflow.stream_project`, filter rows to `[from_, to)`. If `config.ASSUME_SORTED_STREAM=True` (default), short-circuit as soon as `timestamp >= to`. If `False`, drain to EOF. This matches `architect.md` §4 and keeps the fallback explicit.
   - **Empty-stream early return** — after filtering, if zero `ScreenshotRef` remain, return 200 with `answer=""`, zero counts, empty `errors`, and skip fetch/rank/QA entirely. This is also what prevents the partial-failure divide-by-zero.
-  - **Partial-failure counting** — `storage_fetch_failed: int` counter. Each `StorageFetchError` is caught and incremented, the request continues. After the fetch phase, if `total_fetches > 0` **and** `failed / total_fetches > config.MAX_FETCH_FAILURE_RATIO`, raise `PartialFailureThresholdExceeded`. Below the threshold, continue with what succeeded and put the count in `meta.errors["storage_fetch_failed"]`.
+  - **Partial-failure counting** — `storage_fetch_failed: int` counter. Each `StorageFetchError` is caught and incremented, the request continues. After the fetch phase, if `total_fetches > 0` **and** `failed / total_fetches > config.MAX_FETCH_FAILURE_RATIO`, raise `PartialFailureThresholdExceededError`. Below the threshold, continue with what succeeded and put the count in `meta.errors["storage_fetch_failed"]`.
   - **Bounded concurrency** — per-request `asyncio.Semaphore(config.MAX_CONCURRENT_FETCHES)` (default 25).
   - **Ranker** — call `ports.relevance.rank(images, question, config.MAX_RELEVANT_IMAGES)`.
   - **QA** — call `ports.workflow.qa_answer(question, ids)`.
@@ -104,7 +104,7 @@ This is the most important phase. The moment this works, the architecture is pro
 - `app/api/routes.py` — `POST /enriched-qa` handler that:
   - Generates `request_id = str(uuid4())` on entry (Phase 7 moves this to a middleware; see the handoff note in that phase).
   - Calls the orchestrator with the request, dependencies, config, and `request_id`.
-  - Installs exception handlers that **all return the same envelope**: `{"error": "<slug>", "detail": "<human message>", "request_id": "<id>"}` per `architect.md` §7. Mappings: `RequestValidationError` → 400 `error="invalid_request"`, `PartialFailureThresholdExceeded` → 502 `error="storage_partial_failure"`, `WorkflowUpstreamError` → 502 `error="workflow_upstream_failure"`, `asyncio.TimeoutError` → 504 `error="request_timeout"`. (FastAPI's default for validation is 422; the handler overrides it to 400 so the error contract matches `architect.md` §7.)
+  - Installs exception handlers that **all return the same envelope**: `{"error": "<slug>", "detail": "<human message>", "request_id": "<id>"}` per `architect.md` §7. Mappings: `RequestValidationError` → 400 `error="invalid_request"`, `PartialFailureThresholdExceededError` → 502 `error="storage_partial_failure"`, `WorkflowUpstreamError` → 502 `error="workflow_upstream_failure"`, `asyncio.TimeoutError` → 504 `error="request_timeout"`. (FastAPI's default for validation is 422; the handler overrides it to 400 so the error contract matches `architect.md` §7.)
 - `app/main.py` — FastAPI app with a `lifespan` context. **Phase 3 defines only the lifespan shape** — no resources owned yet, since fakes don't need them. Phase 4 adds the shared `httpx.AsyncClient`, Phase 6 adds the `ProcessPoolExecutor`. Both close cleanly on shutdown. Establishing the `lifespan` hook in Phase 3 means Phase 4 and Phase 6 add lines, not scaffolding.
 - `app/deps.py` — dependency providers. **Default wiring for `make run` in Phase 3 is the fake adapters from Phase 2** (`workflow_fake`, `storage_fake`, `relevance_fake`). Phase 4 swaps the default to the real httpx/process-pool adapters. Tests override via `app.dependency_overrides`.
 - `tests/unit/test_orchestrator_happy_path.py` — orchestrator + all fakes → expected answer, checks `images_considered`, `images_relevant`, and absence of `errors`.
@@ -252,7 +252,7 @@ Tests are split by layer. Don't test adapter concerns via the orchestrator or vi
 - empty stream → 200 with `images_considered == 0`.
 - boundary inclusivity: `timestamp == from_` included; `timestamp == to` excluded.
 - storage partial failure **below** threshold → `meta.errors["storage_fetch_failed"] > 0` and the request succeeds.
-- storage failure **above** threshold → `PartialFailureThresholdExceeded` raised.
+- storage failure **above** threshold → `PartialFailureThresholdExceededError` raised.
 - empty time window (zero refs after filtering) → 200 with `answer=""`, `images_considered=0`, and **no calls to storage/ranker/QA** (verified by asserting the fakes' call counters stayed at zero).
 - stream-sorted assumption: when `assume_sorted_stream=True`, the orchestrator stops pulling after the first `timestamp >= to` (verify via a counter on the fake).
 - stream-unsorted fallback: with `assume_sorted_stream=False`, an out-of-order row past `to` does not prematurely end the stream.
@@ -267,7 +267,7 @@ Tests are split by layer. Don't test adapter concerns via the orchestrator or vi
 - POST with body using literal `"from"` (not `"from_"`) returns 200 — catches alias bugs.
 - POST with `from == to` returns **400** (the exception handler overrides FastAPI's default 422).
 - POST with missing `question` returns 400.
-- `PartialFailureThresholdExceeded` maps to 502.
+- `PartialFailureThresholdExceededError` maps to 502.
 
 **Integration test** (`tests/integration/test_end_to_end.py`):
 - Spin up `mock_services.storage_api` and `mock_services.workflow_api` via a pytest fixture. Point the real httpx adapters at them. Assert the full request→answer flow works and `meta` is populated.

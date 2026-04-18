@@ -121,6 +121,8 @@ select = [
 ignore = [
     "D203",   # one-blank-line-before-class (conflicts with D211)
     "D213",   # multi-line-summary-second-line (conflicts with D212)
+    "ANN101", # deprecated: missing-type-self
+    "ANN102", # deprecated: missing-type-cls
     "ANN401", # Allow `typing.Any` where genuinely appropriate
 ]
 
@@ -132,6 +134,9 @@ convention = "google"
 "tests/**" = ["D100", "D101", "D102", "D103", "D104", "ANN001", "ANN201"]
 # mock_services: light-touch scaffolding, full docstring enforcement not required yet
 "mock_services/**" = ["D100", "D104"]
+# Pydantic resolves field annotations at runtime — UUID must stay in the module globals.
+"app/api/schemas.py" = ["TC003", "TCH003"]
+# (flake8's B042 ignore for app/core/errors.py lives in .flake8 - ruff has no B042 equivalent.)
 
 [tool.ruff.format]
 quote-style = "double"

@@ -98,3 +98,61 @@ no-ops when `.git` is absent.
   produces modules whose full test coverage lands in Phase 8. Current
   mitigation: `make test` does *not* enforce coverage (only `make test-cov`
   does), so the tight suite doesn't become a dev-loop friction point.
+
+---
+
+## Phase 2 — Domain model and Port contracts
+
+### Status
+
+Complete. No runtime gate for this phase (no service surface yet). Verified
+via imports, 126 unit tests, and 100% coverage on every new module.
+
+### What shipped
+
+Domain and port contracts, plus the Protocol-satisfying fakes that Phase 3 will
+wire as the `make run` default.
+
+| Module | Surface |
+|---|---|
+| `app/core/models.py` | `ScreenshotRef`, `ScreenshotWithBytes` — both frozen, slotted dataclasses. |
+| `app/core/errors.py` | `EnrichedQAError` base, `StorageFetchError(image_id, cause)`, `WorkflowUpstreamError(cause)`, `PartialFailureThresholdExceededError(failed, total)`. |
+| `app/api/schemas.py` | `EnrichedQARequest` (UUID, `from_` aliased to `from`, window validator, 1-1024 char question), `Meta`, `EnrichedQAResponse`. |
+| `app/ports/{workflow,storage,relevance}.py` | All three Protocols decorated `@runtime_checkable`. |
+| `app/config.py` | `pydantic-settings` `Settings` model with all fields from `architect.md` §11. |
+| `app/adapters/storage_fake.py` | `FakeScreenshotStorage` — dict-backed, has `missing` override, tracks `call_count`. |
+| `app/adapters/relevance_fake.py` | `FakeRelevanceRanker` — deterministic SHA-256 ordering, respects `top_k`. |
+| `app/adapters/workflow_fake.py` | `FakeWorkflowServicesClient` — configurable refs, canned answer, records `qa_calls` with a defensive copy. |
+
+### Tests
+
+126 unit tests across 8 files (`tests/unit/test_*.py`). Each file tests only
+what its target promises via signature + docstring. Coverage enforced at 93%;
+actual is 100% on the Phase 2 modules.
+
+Adversarial / boundary cases wired in:
+
+- **Schemas:** `from == to` rejected, `from > to` rejected, negative from/to rejected, `from = 0` accepted, empty question rejected, 1-char/1024-char accepted, 1025-char rejected, invalid UUID rejected. `Meta` negative count rejected. `populate_by_name` proven for both `"from"` and `"from_"`.
+- **Errors:** subclass relationship, attribute preservation (identity-check on `cause`), message contains image id and cause, `total=0` constructor doesn't divide by zero.
+- **Models:** frozen (FrozenInstanceError on attribute reassign), structural equality, hashability.
+- **Ports:** `@runtime_checkable` confirmed; empty class fails `isinstance`; each fake passes `isinstance`.
+- **Config:** defaults asserted field-by-field, env overrides checked (int/str/bool), case-insensitive env names, ratio boundary at 0.0 and 1.0, `PositiveInt` rejects zero/negative.
+- **Fakes:** call counters, error paths, order preservation, defensive copy (caller mutating input list after `qa_answer` does not mutate recorded call).
+
+### Verification
+
+```
+126 passed in 0.36s
+Required test coverage of 93.0% reached. Total coverage: 100.00%
+ruff: all checks passed
+flake8: exit 0
+mypy: Success — no issues found in 19 source files
+```
+
+### Deviations from plan.md
+
+- **Class rename: `PartialFailureThresholdExceeded` → `PartialFailureThresholdExceededError`.** `pep8-naming` (`N818`) requires the `-Error` suffix. Preferred a rename over `# noqa` so the convention holds globally. Both `plan.md` and `architect.md` updated.
+- **`EnrichedQAError` base class added** (not in `plan.md`). Gives handlers a single `except` clause for the whole domain hierarchy. Three-line addition, caught zero tests.
+- **`# noqa: B042`** on `StorageFetchError.__init__` was lost to formatter stripping. Moved the waiver to `.flake8`'s `per-file-ignores` so the formatter can't touch it. Rationale: these exceptions are consumed at HTTP handler boundaries, never pickled or `copy.copy`'d.
+- **`# noqa: TC003`** on `uuid.UUID` import in `app/api/schemas.py`. Pydantic resolves field annotations at runtime; moving `UUID` behind `TYPE_CHECKING` would break schema construction. All other `TC001/TC003` hits moved into `TYPE_CHECKING` blocks where annotations are genuinely lazy.
+- **Test-layer discipline enforced.** Every test file reads only the signature + docstring of its target module. The test-writing process treated the implementation as opaque.

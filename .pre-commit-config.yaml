@@ -16,7 +16,9 @@ repos:
         args: [--fix=lf]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.9
+    # Keep in lockstep with ruff version in pyproject.toml dev deps to avoid
+    # rule-name drift (e.g. TCH vs TC codes) between local and CI runs.
+    rev: v0.15.11
     hooks:
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix]

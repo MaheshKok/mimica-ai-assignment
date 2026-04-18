@@ -215,7 +215,7 @@ Silent data loss in a QA context produces confidently wrong answers. The policy 
 
 - Each storage fetch that fails (404, timeout, 5xx) is recorded but does not abort the request. The adapter raises `StorageFetchError`; the orchestrator catches it and increments a counter.
 - Failures are counted and exposed in `meta.errors` (e.g. `storage_fetch_failed: 3`).
-- **Fail-fast threshold:** if `total_fetches > 0` *and* `failed / total_fetches > MAX_FETCH_FAILURE_RATIO` (default 0.2), the orchestrator raises `PartialFailureThresholdExceeded` and the request returns `502`. The `total > 0` guard is essential — without it, an empty window would divide by zero.
+- **Fail-fast threshold:** if `total_fetches > 0` *and* `failed / total_fetches > MAX_FETCH_FAILURE_RATIO` (default 0.2), the orchestrator raises `PartialFailureThresholdExceededError` and the request returns `502`. The `total > 0` guard is essential — without it, an empty window would divide by zero.
 - **Empty-window short-circuit:** if zero screenshots remain in `[from, to)` after streaming, return `200` with `answer: ""`, `images_considered: 0`, empty `errors`, and **skip fetch, rank, and QA entirely**. This is the same path that makes the threshold safe (nothing to divide, nothing to fail).
 
 ---
@@ -285,7 +285,7 @@ Tests are split by layer to keep each suite honest about what it owns (see `plan
 - Boundary inclusivity: `timestamp == from` included, `timestamp == to` excluded.
 - Sorted-stream short-circuit triggers under `ASSUME_SORTED_STREAM=True`; drains to EOF under `False`.
 - Storage 404s below threshold: dropped, counted in `meta.errors`, request succeeds.
-- Storage failures above threshold: `PartialFailureThresholdExceeded` → 502.
+- Storage failures above threshold: `PartialFailureThresholdExceededError` → 502.
 - Orchestrator propagates `WorkflowUpstreamError` unchanged (the 5xx→error mapping is the adapter's job, tested there).
 - Ranker returns IDs in a known order; orchestrator preserves that order when calling `qa_answer`.
 
@@ -300,7 +300,7 @@ Tests are split by layer to keep each suite honest about what it owns (see `plan
 
 - POST with literal `"from"` body key returns 200 (alias round-trip).
 - POST with `from == to` returns 400 (handler overrides FastAPI's default 422).
-- `PartialFailureThresholdExceeded` maps to 502.
+- `PartialFailureThresholdExceededError` maps to 502.
 
 ### Concurrency / capacity
 
