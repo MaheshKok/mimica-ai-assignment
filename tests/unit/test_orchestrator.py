@@ -23,7 +23,7 @@ from app.core.errors import (
     WorkflowUpstreamError,
 )
 from app.core.models import ScreenshotRef
-from app.core.orchestrator import run
+from app.core.orchestrator import _sample_uniform_over_window, run
 from app.deps import Ports
 
 if TYPE_CHECKING:
@@ -458,3 +458,125 @@ class TestConcurrencyBound:
         # Also prove the cap was actually exercised — we wouldn't want a
         # bug where the semaphore is mistakenly 1.
         assert tracking.peak >= 2
+
+
+# --------------------------------------------------------------------------- #
+# Pre-fetch sampling                                                          #
+# --------------------------------------------------------------------------- #
+
+
+class TestSampleUniformOverWindow:
+    def test_returns_input_unchanged_when_under_limit(self) -> None:
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(5)]
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
+        assert out == refs
+
+    def test_returns_input_unchanged_when_exactly_at_limit(self) -> None:
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(10)]
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
+        assert out == refs
+
+    def test_caps_at_max_input(self) -> None:
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(100)]
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
+        assert len(out) <= 10
+
+    def test_preserves_stream_order(self) -> None:
+        # Sampling keeps the first-encountered ref per bucket, which when
+        # iteration order == timestamp order equals timestamp-ascending.
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(100)]
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
+        timestamps = [r.timestamp for r in out]
+        assert timestamps == sorted(timestamps)
+
+    def test_distributes_across_window(self) -> None:
+        # With 1000 refs spanning [0, 100), sampling into 10 buckets of
+        # width 10 should yield one ref per bucket. The selected refs'
+        # timestamps should cover each bucket exactly once.
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(1000)]
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
+        # Not stricter than the contract, but distribution should be even.
+        assert len(out) == 10
+        bucket_widths = [r.timestamp // 10 for r in out]
+        assert sorted(bucket_widths) == list(range(10))
+
+    def test_clustered_input_returns_fewer_than_max(self) -> None:
+        # If every ref falls in the same bucket, only one is returned.
+        # The contract says "at most max_input", not "exactly max_input".
+        refs = [ScreenshotRef(timestamp=5, image_id=f"i-{i}") for i in range(50)]
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
+        assert len(out) == 1
+        assert out[0].image_id == "i-0"  # first-wins per bucket
+
+    def test_empty_input_returns_empty(self) -> None:
+        assert _sample_uniform_over_window([], from_=0, to=100, max_input=10) == []
+
+    def test_max_input_of_one_returns_one_ref(self) -> None:
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(100)]
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=1)
+        assert len(out) == 1
+
+    def test_boundary_timestamp_near_upper_bound(self) -> None:
+        # Timestamp at to-1 is in the window; float rounding must not push
+        # it into a bucket beyond max_input-1.
+        refs = [ScreenshotRef(timestamp=99, image_id="a")]
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
+        assert out == refs
+
+
+class TestOrchestratorSampling:
+    async def test_images_considered_counts_pre_sample_not_post(self) -> None:
+        # 100 refs, but MAX_RANK_INPUT=5. images_considered must show the
+        # full 100 the filter saw - not the sampled 5. This is the value
+        # downstream observability will graph, so it must not silently
+        # underreport.
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(100)]
+        ports = _ports(refs=refs)
+        resp = await run(
+            _req(from_=0, to=100),
+            ports,
+            _settings(max_rank_input=5, max_relevant_images=100),
+            "r",
+        )
+        assert resp.meta.images_considered == 100
+
+    async def test_fetch_only_happens_for_sampled_refs(self) -> None:
+        # Prove sampling happens BEFORE fetch: with 100 refs and
+        # max_rank_input=5, the storage fake's call_count must be <= 5.
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(100)]
+        ports = _ports(refs=refs)
+        await run(
+            _req(from_=0, to=100),
+            ports,
+            _settings(max_rank_input=5),
+            "r",
+        )
+        storage = ports.storage
+        assert isinstance(storage, FakeScreenshotStorage)
+        assert storage.call_count <= 5, (
+            f"sampling must happen before fetch; storage was called "
+            f"{storage.call_count} times for a max_rank_input of 5"
+        )
+        # Also sanity: actually called SOMETHING
+        assert storage.call_count >= 1
+
+    async def test_partial_failure_ratio_computed_over_sampled_total(self) -> None:
+        # 100 refs filtered in; max_rank_input=10 narrows to 10 fetches.
+        # Mark 3 of those as missing (30%). With default ratio 0.2, that's
+        # above threshold and should raise.
+        refs = [ScreenshotRef(timestamp=i, image_id=f"i-{i}") for i in range(100)]
+        # We can't predict exactly which 10 get sampled, but every 10th
+        # timestamp is a good bet with bucket_width=10 and stride 1:
+        # sampler picks timestamps 0, 10, 20, ... 90 -> that's the sample.
+        # Mark 0, 10, 20 as missing to drive >20% failure.
+        sampled_guess = {"i-0", "i-10", "i-20"}
+        ports = _ports(refs=refs, missing=sampled_guess)
+        with pytest.raises(PartialFailureThresholdExceededError) as excinfo:
+            await run(
+                _req(from_=0, to=100),
+                ports,
+                _settings(max_rank_input=10, max_fetch_failure_ratio=0.2),
+                "r",
+            )
+        assert excinfo.value.total == 10  # sampled size, not 100
+        assert excinfo.value.failed == 3

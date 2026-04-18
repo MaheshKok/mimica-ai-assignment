@@ -238,3 +238,55 @@ Two modules (`app/api/routes.py`, `app/deps.py`) deliberately **do not** use `fr
 - 100% coverage, gate 93%.
 - ruff + flake8 + mypy all clean.
 - Live uvicorn: normal `curl` → 200; bad window → 400 no input echo; hung port with `REQUEST_TIMEOUT_MS=50` → 504 in 57ms.
+
+---
+
+## Phase 4 — Real HTTP adapters
+
+### Status
+
+Complete. **Gate passed.** Three test surfaces:
+
+1. Orchestrator unit tests (Protocol fakes) — unchanged, still green.
+2. Adapter tests (`httpx.MockTransport`) — all new; verify URL shape, error mapping, NDJSON parsing.
+3. Wire-up tests (`app.dependency_overrides`) — unchanged, still green.
+
+Live smoke: `curl` against unreachable upstream returns **502 `workflow_upstream_failure`** with correct envelope.
+
+### What shipped
+
+| Module | Surface |
+|---|---|
+| `app/adapters/workflow_http.py` | `HttpxWorkflowServicesClient(client, base_url)`. `stream_project` opens `client.stream("GET", ...)` and iterates `aiter_lines()`, mapping `screenshot_url` → `image_id` at the boundary. `qa_answer` POSTs JSON and extracts the `answer` field as `str`. Malformed NDJSON lines are logged and skipped; any 4xx/5xx/transport error → `WorkflowUpstreamError`. |
+| `app/adapters/storage_http.py` | `HttpxScreenshotStorageClient(client, base_url, global_semaphore)`. `get_image` acquires the injected process-wide semaphore inside the per-request semaphore held by the orchestrator. Any 4xx/5xx/transport error → `StorageFetchError(image_id, cause)`. |
+| `app/core/orchestrator.py` | **Pre-fetch sampling.** New `_sample_uniform_over_window` bins refs into `max_rank_input` equal-width buckets over `[from, to)` and keeps the first per bucket. The orchestrator calls this between filter and fetch, so `images_considered` reflects the pre-sampling count while the partial-failure ratio is computed over the *sampled* set. We never fetch images we'd discard. |
+| `app/deps.py` | New `build_http_ports(client, settings, global_semaphore)` factory. `build_demo_ports` kept for offline tests. |
+| `app/main.py` | Lifespan now constructs the shared `httpx.AsyncClient` (with `Limits(100/50)` and a 30s read timeout) and a process-wide `asyncio.Semaphore(GLOBAL_FETCH_CONCURRENCY)`, stashes them on `app.state`, composes `Ports` via `build_http_ports`, and `aclose()`s the client on shutdown. |
+
+### Tests
+
+216 total (up from 179). New files:
+
+- `tests/unit/test_workflow_http.py` — 18 tests: valid NDJSON parsing, `screenshot_url`→`image_id` mapping, malformed/missing-field/empty-line skipping, 5xx/4xx/transport-error → `WorkflowUpstreamError`, URL shape, qa_answer request body inspection + id-order preservation on the wire, non-JSON/missing-answer/non-string-answer responses → `WorkflowUpstreamError`, base-URL trailing-slash normalisation.
+- `tests/unit/test_storage_http.py` — 9 tests: 200 returns bytes, 404/500/timeout/connect-error → `StorageFetchError`, URL pattern, **global semaphore caps peak concurrency at 3 for 20 concurrent fetches**, **semaphore released on error** (cap=1, two 500s then a success proves no deadlock).
+- `tests/unit/test_orchestrator.py` extended with 11 new tests covering `_sample_uniform_over_window` (returns unchanged under/at limit, caps at max, preserves order, spreads across window, clustered input returns fewer, empty input, `max_input=1`, upper-boundary rounding) plus 3 tests on orchestrator integration: `images_considered` reflects pre-sample count, storage is called at most `MAX_RANK_INPUT` times, failure ratio is computed over the sampled total.
+
+### Verification
+
+```
+make test       216 passed in 1.60s
+make test-cov   100% coverage (gate 93%)
+make lint       ruff + flake8 both clean
+make typecheck  mypy strict clean (25 source files)
+pre-commit run --all-files  all 11 hooks pass
+live uvicorn   unreachable upstream -> 502 workflow_upstream_failure envelope
+```
+
+### Deviations from plan.md
+
+- Per-hop timeouts simplified to a single client-level `httpx.Timeout(connect=5, read=30, write=10, pool=5)` rather than different timeouts per call site. Plan listed per-hop timeouts as SHOULD; the route-level `asyncio.timeout(REQUEST_TIMEOUT_MS)` is the hard budget anyway, and splitting httpx-level timeouts per call adds complexity for little gain.
+- Pre-commit mypy env extended with `httpx`. Same pattern as Phase 3 adding fastapi/structlog/pydantic-settings — the hook's isolated env needs every lib with public types so decorator and attribute types resolve.
+
+### Known gap (Phase 5 will resolve)
+
+- `make run` without Phase 5's mock services running returns `502 workflow_upstream_failure` because the HTTP adapter can't reach `localhost:9000`/`:9100`. This is exactly what `plan.md` predicted and why Phase 5 brings up the separable mock services.

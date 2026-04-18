@@ -41,14 +41,20 @@ async def run(
     1. Stream the project's screenshots and filter to ``[req.from_, req.to)``.
     2. If no refs remain after filtering, return a 200 with ``answer=""`` and
        zero counts. Fetch, rank, and QA are skipped entirely.
-    3. Fetch image bytes with per-request bounded concurrency. Each
+    3. **Pre-fetch sampling.** If the filtered ref list exceeds
+       ``config.max_rank_input``, downsample uniformly over the
+       ``[from_, to)`` window. This keeps timestamps intact and avoids
+       fetching images that would be discarded anyway. ``images_considered``
+       in the response reflects the pre-sampling count - the filtered
+       set the service genuinely saw.
+    4. Fetch image bytes with per-request bounded concurrency. Each
        :class:`~app.core.errors.StorageFetchError` is caught and counted.
-    4. If ``failed / total > config.max_fetch_failure_ratio`` (only when
+    5. If ``failed / total > config.max_fetch_failure_ratio`` (only when
        ``total > 0``), raise :class:`~app.core.errors.PartialFailureThresholdExceededError`.
-    5. Rank up to ``config.max_relevant_images`` most relevant ids.
-    6. Call :meth:`WorkflowServicesClient.qa_answer` with the ranker order
+    6. Rank up to ``config.max_relevant_images`` most relevant ids.
+    7. Call :meth:`WorkflowServicesClient.qa_answer` with the ranker order
        preserved.
-    7. Return :class:`EnrichedQAResponse` including timing and counters.
+    8. Return :class:`EnrichedQAResponse` including timing and counters.
 
     Args:
         req: Validated request body.
@@ -94,13 +100,25 @@ async def run(
             ),
         )
 
-    # 3. Fetch with bounded concurrency + partial-failure counting
+    # 3. Pre-fetch sampling: cap work at MAX_RANK_INPUT by sampling over
+    # the request window. We sample `ScreenshotRef` values (not bytes)
+    # so timestamps survive and we never fetch images we'd discard.
+    refs_to_fetch = _sample_uniform_over_window(
+        refs,
+        from_=req.from_,
+        to=req.to,
+        max_input=config.max_rank_input,
+    )
+
+    # 4. Fetch with bounded concurrency + partial-failure counting
     fetch_start = time.perf_counter()
-    images, failed = await _fetch_all(ports, refs, max_concurrent=config.max_concurrent_fetches)
+    images, failed = await _fetch_all(
+        ports, refs_to_fetch, max_concurrent=config.max_concurrent_fetches
+    )
     latency["fetch"] = _elapsed_ms(fetch_start)
 
-    # 4. Partial-failure threshold (total > 0 here by construction)
-    total_fetches = len(refs)
+    # 5. Partial-failure threshold (total > 0 here by construction)
+    total_fetches = len(refs_to_fetch)
     if failed / total_fetches > config.max_fetch_failure_ratio:
         raise PartialFailureThresholdExceededError(failed=failed, total=total_fetches)
 
@@ -213,3 +231,47 @@ async def _fetch_all(
 def _elapsed_ms(start: float) -> int:
     """Return elapsed milliseconds since ``start`` (from :func:`time.perf_counter`)."""
     return max(int((time.perf_counter() - start) * 1000), 0)
+
+
+def _sample_uniform_over_window(
+    refs: list[ScreenshotRef],
+    *,
+    from_: int,
+    to: int,
+    max_input: int,
+) -> list[ScreenshotRef]:
+    """Downsample ``refs`` uniformly over the ``[from_, to)`` time window.
+
+    Partitions the window into ``max_input`` equal-width buckets and keeps
+    the first ref encountered for each bucket. This preserves the caller's
+    iteration order (stream order), guarantees a result size of at most
+    ``max_input``, and - when refs are distributed across the window -
+    yields a representative sample instead of a blind head-N slice.
+
+    Args:
+        refs: Filtered refs from the stream. May be empty.
+        from_: Window lower bound (inclusive). Must be less than ``to``.
+        to: Window upper bound (exclusive).
+        max_input: Maximum allowed size of the returned list. Must be > 0.
+
+    Returns:
+        A list of at most ``max_input`` refs. Returned unchanged when
+        already at or below the cap.
+    """
+    if len(refs) <= max_input:
+        return refs
+    # Caller (orchestrator) has already validated the window is non-empty
+    # and that this path is only reached when refs > 0.
+    bucket_width = (to - from_) / max_input
+    selected: dict[int, ScreenshotRef] = {}
+    for ref in refs:
+        idx = int((ref.timestamp - from_) / bucket_width)
+        # Clamp the last bucket: timestamp == to-1 (nearly at edge) may
+        # round to `max_input`. Clip to the last bucket to avoid a stray
+        # key that'd make the result larger than max_input in pathological
+        # float rounding.
+        if idx >= max_input:
+            idx = max_input - 1
+        if idx not in selected:
+            selected[idx] = ref
+    return list(selected.values())

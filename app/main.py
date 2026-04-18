@@ -16,10 +16,12 @@ sensitive request bodies are not reflected to callers.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -30,10 +32,22 @@ from app.core.errors import (
     PartialFailureThresholdExceededError,
     WorkflowUpstreamError,
 )
-from app.deps import build_demo_ports
+from app.deps import build_http_ports
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+
+# httpx client connection caps. Per architect.md §6: the transport-level
+# cap matches the application-level GLOBAL_FETCH_CONCURRENCY default so
+# neither layer silently becomes the bottleneck. Keepalive cap is half.
+_HTTPX_MAX_CONNECTIONS = 100
+_HTTPX_KEEPALIVE = 50
+# Connect/read/write/pool timeouts on the shared client. Read timeout is
+# larger than connect because streams can be slow. The route-level
+# `asyncio.timeout(REQUEST_TIMEOUT_MS)` is the hard upper bound; these
+# timeouts are the unhealthy-connection safety net underneath it.
+_HTTPX_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
 
 
 def _request_id(request: Request) -> str:
@@ -86,20 +100,46 @@ def _format_validation_errors(exc: RequestValidationError) -> str:
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     """Application lifespan - owns the per-app resources.
 
-    Phase 3 constructs fresh fakes and :class:`Settings`. Phase 4 will
-    additionally create a shared ``httpx.AsyncClient`` here and close it
-    in the ``finally`` branch; Phase 6 adds the
-    ``ProcessPoolExecutor`` in the same shape. The dependency layer
-    (:mod:`app.deps`) never owns these resources - it reads them from
-    ``app.state``.
+    Constructs and stashes on ``app.state``:
+
+    - ``settings``: the current :class:`Settings` snapshot.
+    - ``http_client``: the shared :class:`httpx.AsyncClient` used by both
+      HTTP adapters. Connection caps match architect.md section 6.
+    - ``global_fetch_semaphore``: the process-wide storage concurrency
+      cap injected into the storage adapter.
+    - ``ports``: the :class:`Ports` bundle composed from HTTP adapters
+      plus the current (fake, Phase 6 replaces it) relevance ranker.
+
+    Cleanup closes the HTTP client on shutdown so connections drain
+    cleanly. Phase 6 adds ``ProcessPoolExecutor`` shutdown to the same
+    ``finally`` branch.
     """
-    application.state.settings = Settings()
-    application.state.ports = build_demo_ports()
+    settings = Settings()
+    application.state.settings = settings
+
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=_HTTPX_MAX_CONNECTIONS,
+            max_keepalive_connections=_HTTPX_KEEPALIVE,
+        ),
+        timeout=_HTTPX_TIMEOUT,
+    )
+    application.state.http_client = http_client
+
+    global_fetch_semaphore = asyncio.Semaphore(settings.global_fetch_concurrency)
+    application.state.global_fetch_semaphore = global_fetch_semaphore
+
+    application.state.ports = build_http_ports(
+        client=http_client,
+        settings=settings,
+        global_semaphore=global_fetch_semaphore,
+    )
+
     try:
         yield
     finally:
-        # Phase 4 closes httpx client; Phase 6 shuts down process pool.
-        pass
+        # Phase 6 adds process-pool shutdown here alongside http close.
+        await http_client.aclose()
 
 
 def create_app() -> FastAPI:

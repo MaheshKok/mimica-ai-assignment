@@ -45,6 +45,7 @@ repos:
         args: [--config-file=pyproject.toml]
         additional_dependencies:
           - fastapi>=0.111
+          - httpx>=0.27
           - pydantic>=2.7
           - pydantic-settings>=2.3
           - structlog>=24.1

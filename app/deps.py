@@ -18,14 +18,18 @@ annotations``. FastAPI's dependency-analysis step classifies the
 make it misidentify ``request`` as a query parameter.
 """
 
+import asyncio
 from dataclasses import dataclass
 from typing import cast
 
+import httpx
 from fastapi import Request
 
 from app.adapters.relevance_fake import FakeRelevanceRanker
 from app.adapters.storage_fake import FakeScreenshotStorage
+from app.adapters.storage_http import HttpxScreenshotStorageClient
 from app.adapters.workflow_fake import FakeWorkflowServicesClient
+from app.adapters.workflow_http import HttpxWorkflowServicesClient
 from app.config import Settings
 from app.core.models import ScreenshotRef
 from app.ports.relevance import RelevanceRanker
@@ -51,17 +55,54 @@ class Ports:
     relevance: RelevanceRanker
 
 
-def build_demo_ports() -> Ports:
-    """Construct the Phase 3 fake port bundle used by ``make run``.
+def build_http_ports(
+    *,
+    client: httpx.AsyncClient,
+    settings: Settings,
+    global_semaphore: asyncio.Semaphore,
+) -> Ports:
+    """Construct a :class:`Ports` bundle using the real HTTP adapters.
 
-    Populates the workflow fake with three refs inside ``[1_000_000,
-    1_000_100)`` and the storage fake with matching bytes, so a curl
-    against the running service returns a non-empty answer end-to-end.
+    Phase 4 default wiring. Lifespan owns the ``httpx.AsyncClient`` and
+    the ``global_semaphore``; this factory just composes adapters from
+    them. No network call happens at construction time; the first call
+    is deferred to the first request.
+
+    Args:
+        client: Shared async HTTP client.
+        settings: Active settings; supplies the Workflow and Storage
+            base URLs.
+        global_semaphore: Process-wide storage concurrency cap. Injected
+            into the storage adapter so every fetch honours it.
 
     Returns:
-        A :class:`Ports` bundle wrapping fresh fakes. Lifespan calls this
-        once at startup; tests construct their own bundles via
-        :func:`app.dependency_overrides` and never read from app state.
+        A :class:`Ports` bundle wiring the HTTP adapters and the
+        relevance ranker (fake for now; replaced in Phase 6).
+    """
+    return Ports(
+        workflow=HttpxWorkflowServicesClient(client=client, base_url=settings.workflow_api_url),
+        storage=HttpxScreenshotStorageClient(
+            client=client,
+            base_url=settings.storage_base_url,
+            global_semaphore=global_semaphore,
+        ),
+        # Phase 6 replaces this with the ProcessPoolExecutor-backed ranker.
+        relevance=FakeRelevanceRanker(),
+    )
+
+
+def build_demo_ports() -> Ports:
+    """Construct the Phase 3 fake port bundle.
+
+    Kept available for tests that want a fully-offline bundle; the
+    default `make run` path now uses :func:`build_http_ports`. Populates
+    the workflow fake with three refs inside ``[1_000_000, 1_000_100)``
+    and the storage fake with matching bytes.
+
+    Returns:
+        A :class:`Ports` bundle wrapping fresh fakes. Each call builds
+        new instances - resource ownership is the lifespan's job, not
+        this factory's.
     """
     demo_refs = [
         ScreenshotRef(timestamp=1_000_000, image_id="img-demo-1.png"),
