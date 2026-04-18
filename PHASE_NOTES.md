@@ -218,3 +218,23 @@ curl -sS -X POST ... -d '{"from": 10, "to": 10, ...}'         -> HTTP 400 + {err
 ### Acknowledged but not acted on
 
 - `RequestValidationError.errors()` is rendered via `str(...)` in the 400 envelope's `detail`. This produces a Python repr with quoted field names; not elegant. Replacing with a structured list is Phase 9 polish.
+
+### Post-adversarial-review fixes (commit pending)
+
+Two reviewers converged on the same Phase 3 boundary gaps — both blockers before Phase 4 lands real adapters. Four fixes applied in one pass:
+
+1. **Ports moved to lifespan ownership.** `_DEFAULT_PORTS` module-global removed. `lifespan` now constructs `Settings` and calls `build_demo_ports()` and stashes both on `app.state`. `get_settings(request)` and `get_ports(request)` read from `request.app.state`. Phase 4's `httpx.AsyncClient` and Phase 6's `ProcessPoolExecutor` drop into the same lifespan `try/finally` without changing the dependency shape. Test `test_deps.py` rewritten to verify this and to assert `AttributeError` when lifespan hasn't run.
+2. **Request-timeout budget enforced at the route boundary.** `post_enriched_qa` wraps `run(...)` in `async with asyncio.timeout(config.request_timeout_ms / 1000)`. Live smoke-tested: `request_timeout_ms=50` + a hung workflow returns **504 in 57ms** with the correct envelope. Two tests added in `test_boundary_contracts.py`: hung dependency → 504, fast request not cut off.
+3. **`request_id` stashed on `request.state` before calling the orchestrator.** Exception handlers read `request.state.request_id` instead of generating a fresh uuid in the 400/502/504 paths. Test added: forced error returns an envelope whose `request_id` equals the fixed value produced by `uuid4` (monkeypatched to a known value), proving the handler reads what the route stashed — not a fresh uuid.
+4. **Validation-error detail sanitised.** `_format_validation_errors` builds a compact `loc: msg` summary from `exc.errors()`, deliberately dropping the `input` field Pydantic includes. Before: caller's `project_id`, `from`, `to`, and `question` all reflected back in the 400 body. After: only field names and validation messages appear. Two tests: secret marker in the question body never appears anywhere in the 400 response, and `project_id` value `"not-a-uuid"` appears nowhere even though the field name does.
+
+### Important structural constraint documented
+
+Two modules (`app/api/routes.py`, `app/deps.py`) deliberately **do not** use `from __future__ import annotations`. FastAPI's dependency-analysis step classifies `Request`/`Settings`-typed parameters via class-identity checks; stringified annotations cause FastAPI to misclassify `request` as a query parameter (reproduced empirically before the fix). Per-file-ignores for `TC001/TC002/TC003` added to both `pyproject.toml` and `.flake8` so the lint rules don't push the imports back into `TYPE_CHECKING` blocks. Module docstrings spell this out to prevent future "harmless cleanup" commits from reintroducing the bug.
+
+### Verification
+
+- 179 tests pass (up from 171). New test file `tests/unit/test_boundary_contracts.py` (6 tests covering timeout, request-id correlation, input sanitisation).
+- 100% coverage, gate 93%.
+- ruff + flake8 + mypy all clean.
+- Live uvicorn: normal `curl` → 200; bad window → 400 no input echo; hung port with `REQUEST_TIMEOUT_MS=50` → 504 in 57ms.

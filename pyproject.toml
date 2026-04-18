@@ -134,6 +134,12 @@ convention = "google"
 "mock_services/**" = ["D100", "D104"]
 # Pydantic resolves field annotations at runtime — UUID must stay in the module globals.
 "app/api/schemas.py" = ["TC003", "TCH003"]
+# FastAPI classifies dependency parameters by class identity; Request and Settings
+# must be eagerly-evaluated, and Port protocols are dataclass field types used
+# without `from __future__ import annotations` in this module.
+"app/deps.py" = ["TC001", "TC002", "TC003"]
+# Same reason as deps.py - FastAPI requires runtime-evaluable annotations on the route.
+"app/api/routes.py" = ["TC001", "TC002", "TC003"]
 # (flake8's B042 ignore for app/core/errors.py lives in .flake8 - ruff has no B042 equivalent.)
 
 [tool.ruff.format]

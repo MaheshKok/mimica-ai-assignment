@@ -10,6 +10,8 @@ per-file-ignores =
     mock_services/*:D100,D104
     app/core/errors.py:B042
     app/api/schemas.py:TC003
+    app/deps.py:TC001,TC002,TC003
+    app/api/routes.py:TC001,TC002,TC003
 exclude =
     .git,
     .venv,

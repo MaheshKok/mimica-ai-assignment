@@ -1,56 +1,84 @@
 """Tests for :mod:`app.deps`.
 
-Exercises the default dependency providers directly so the demo fakes are
-reachable from coverage and the cached ``get_ports`` behaviour is pinned
-down.
+Exercises the demo-port factory and the request-scoped providers. The
+providers read from ``request.app.state``, so lifespan owns the
+resources - there is no module-global singleton to worry about.
 """
 
 from __future__ import annotations
 
-import app.deps as deps_module
+from types import SimpleNamespace
+
+from fastapi import FastAPI
+
 from app.adapters.relevance_fake import FakeRelevanceRanker
 from app.adapters.storage_fake import FakeScreenshotStorage
 from app.adapters.workflow_fake import FakeWorkflowServicesClient
 from app.config import Settings
-from app.deps import Ports, get_ports, get_settings
+from app.deps import Ports, build_demo_ports, get_ports, get_settings
 
 
-class TestGetSettings:
-    def test_returns_settings_instance(self) -> None:
-        assert isinstance(get_settings(), Settings)
-
-    def test_cached_returns_same_object(self) -> None:
-        assert get_settings() is get_settings()
+def _stub_request(app: FastAPI) -> SimpleNamespace:
+    """Build a minimal object exposing ``.app`` the providers can read."""
+    return SimpleNamespace(app=app)
 
 
-class TestGetPorts:
-    def test_returns_ports_with_default_fakes(self) -> None:
-        # Reset the module-global so this test sees a fresh singleton.
-        deps_module._DEFAULT_PORTS = None
-        ports = get_ports()
+class TestBuildDemoPorts:
+    def test_returns_ports_with_fake_adapters(self) -> None:
+        ports = build_demo_ports()
         assert isinstance(ports, Ports)
         assert isinstance(ports.workflow, FakeWorkflowServicesClient)
         assert isinstance(ports.storage, FakeScreenshotStorage)
         assert isinstance(ports.relevance, FakeRelevanceRanker)
 
-    def test_cached_returns_same_instance(self) -> None:
-        deps_module._DEFAULT_PORTS = None
-        first = get_ports()
-        second = get_ports()
-        assert first is second, "get_ports must cache the default bundle"
-
-    def test_demo_data_roundtrips(self) -> None:
-        """Demo refs populated in the fake are also present in storage.
-
-        The ``make run`` path depends on refs in the workflow fake matching
-        image ids present in the storage fake. If this ever drifts, a live
-        curl against the service will fail with a partial-failure error.
-        """
-        deps_module._DEFAULT_PORTS = None
-        ports = get_ports()
+    def test_demo_refs_match_storage_images(self) -> None:
+        # Regression guard: make run's curl would 502 with partial-failure
+        # if a demo ref id lacks a matching storage entry.
+        ports = build_demo_ports()
         wf = ports.workflow
         st = ports.storage
         assert isinstance(wf, FakeWorkflowServicesClient)
         assert isinstance(st, FakeScreenshotStorage)
+        assert wf.refs, "demo fake workflow must have refs for a non-empty answer"
         for ref in wf.refs:
             assert ref.image_id in st.images
+
+    def test_each_call_returns_fresh_instance(self) -> None:
+        # Resource ownership is lifespan's job; this factory must not
+        # share state across invocations.
+        a = build_demo_ports()
+        b = build_demo_ports()
+        assert a is not b
+        assert a.workflow is not b.workflow
+
+
+class TestGetSettings:
+    def test_reads_from_app_state(self) -> None:
+        app = FastAPI()
+        app.state.settings = Settings(_env_file=None)  # type: ignore[arg-type]
+        assert get_settings(_stub_request(app)) is app.state.settings  # type: ignore[arg-type]
+
+    def test_raises_when_lifespan_did_not_run(self) -> None:
+        app = FastAPI()
+        # state exists but has no 'settings' attribute
+        try:
+            get_settings(_stub_request(app))  # type: ignore[arg-type]
+        except AttributeError:
+            return
+        raise AssertionError("expected AttributeError when settings not stashed")
+
+
+class TestGetPorts:
+    def test_reads_from_app_state(self) -> None:
+        app = FastAPI()
+        ports = build_demo_ports()
+        app.state.ports = ports
+        assert get_ports(_stub_request(app)) is ports  # type: ignore[arg-type]
+
+    def test_raises_when_lifespan_did_not_run(self) -> None:
+        app = FastAPI()
+        try:
+            get_ports(_stub_request(app))  # type: ignore[arg-type]
+        except AttributeError:
+            return
+        raise AssertionError("expected AttributeError when ports not stashed")
