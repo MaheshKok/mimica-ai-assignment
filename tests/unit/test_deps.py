@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 
 from app.adapters.relevance_fake import FakeRelevanceRanker
@@ -60,12 +61,8 @@ class TestGetSettings:
 
     def test_raises_when_lifespan_did_not_run(self) -> None:
         app = FastAPI()
-        # state exists but has no 'settings' attribute
-        try:
+        with pytest.raises(RuntimeError, match="Application lifespan has not run"):
             get_settings(_stub_request(app))  # type: ignore[arg-type]
-        except AttributeError:
-            return
-        raise AssertionError("expected AttributeError when settings not stashed")
 
 
 class TestGetPorts:
@@ -77,8 +74,5 @@ class TestGetPorts:
 
     def test_raises_when_lifespan_did_not_run(self) -> None:
         app = FastAPI()
-        try:
+        with pytest.raises(RuntimeError, match="Application lifespan has not run"):
             get_ports(_stub_request(app))  # type: ignore[arg-type]
-        except AttributeError:
-            return
-        raise AssertionError("expected AttributeError when ports not stashed")

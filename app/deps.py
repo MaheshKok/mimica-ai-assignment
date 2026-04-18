@@ -19,6 +19,7 @@ make it misidentify ``request`` as a query parameter.
 """
 
 from dataclasses import dataclass
+from typing import cast
 
 from fastapi import Request
 
@@ -79,6 +80,24 @@ def build_demo_ports() -> Ports:
     )
 
 
+def _state_resource(request: Request, name: str) -> object:
+    """Return a resource from app state or explain the missing lifespan.
+
+    Starlette raises a generic ``AttributeError`` when ``app.state`` is
+    missing an attribute. That is technically correct but unhelpful for the
+    common test mistake of using ``TestClient(app)`` without entering the
+    context manager, which means lifespan never populated ``app.state``.
+    """
+    try:
+        return getattr(request.app.state, name)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"Application lifespan has not run; app.state.{name} is missing. "
+            "Use 'with TestClient(app) as client:' in tests or run the app "
+            "through an ASGI server that supports lifespan."
+        ) from exc
+
+
 def get_settings(request: Request) -> Settings:
     """Return the :class:`Settings` stashed on ``request.app.state``.
 
@@ -92,8 +111,7 @@ def get_settings(request: Request) -> Settings:
     Returns:
         The active Settings instance.
     """
-    settings: Settings = request.app.state.settings
-    return settings
+    return cast("Settings", _state_resource(request, "settings"))
 
 
 def get_ports(request: Request) -> Ports:
@@ -110,5 +128,4 @@ def get_ports(request: Request) -> Ports:
     Returns:
         The active Ports bundle.
     """
-    ports: Ports = request.app.state.ports
-    return ports
+    return cast("Ports", _state_resource(request, "ports"))
