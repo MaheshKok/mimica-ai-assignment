@@ -122,3 +122,39 @@ class TestValidators:
     def test_ratio_rejects_negative(self) -> None:
         with pytest.raises(ValidationError):
             _make(max_fetch_failure_ratio=-0.1)  # type: ignore[arg-type]
+
+    def test_filter_workers_accepts_none(self) -> None:
+        assert _make().filter_workers is None
+
+    def test_filter_workers_accepts_positive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FILTER_WORKERS", "4")
+        assert _make().filter_workers == 4
+
+    def test_filter_workers_rejects_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # ProcessPoolExecutor(max_workers=0) is invalid; catch it at load time.
+        monkeypatch.setenv("FILTER_WORKERS", "0")
+        with pytest.raises(ValidationError):
+            _make()
+
+    def test_filter_workers_rejects_negative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FILTER_WORKERS", "-2")
+        with pytest.raises(ValidationError):
+            _make()
+
+
+class TestEnvFileLoading:
+    def test_env_example_loads_without_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # .env.example ships with empty placeholders like `FILTER_WORKERS=`.
+        # env_ignore_empty=True must make those fall back to defaults instead
+        # of failing integer parsing.
+        # Clear any ambient values first so only the file is exercised.
+        for name in (
+            "FILTER_WORKERS",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "WORKFLOW_API_URL",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        from app.config import Settings
+
+        settings = Settings(_env_file=".env.example")  # type: ignore[arg-type]
+        assert settings.filter_workers is None

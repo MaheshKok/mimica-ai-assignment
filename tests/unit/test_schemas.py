@@ -130,6 +130,36 @@ class TestMeta:
         assert meta.errors == {"storage_fetch_failed": 2}
         assert meta.latency_ms == {"total": 900}
 
+    def test_rejects_negative_error_counts(self) -> None:
+        # Counters crossing the HTTP boundary must not be negative.
+        with pytest.raises(ValidationError):
+            Meta(
+                request_id="r1",
+                images_considered=0,
+                images_relevant=0,
+                errors={"storage_fetch_failed": -1},
+            )
+
+    def test_rejects_negative_latency_values(self) -> None:
+        with pytest.raises(ValidationError):
+            Meta(
+                request_id="r1",
+                images_considered=0,
+                images_relevant=0,
+                latency_ms={"total": -10},
+            )
+
+    def test_accepts_zero_error_counts(self) -> None:
+        meta = Meta(
+            request_id="r1",
+            images_considered=0,
+            images_relevant=0,
+            errors={"storage_fetch_failed": 0},
+            latency_ms={"total": 0},
+        )
+        assert meta.errors["storage_fetch_failed"] == 0
+        assert meta.latency_ms["total"] == 0
+
 
 class TestEnrichedQAResponse:
     def test_wraps_answer_and_meta(self) -> None:

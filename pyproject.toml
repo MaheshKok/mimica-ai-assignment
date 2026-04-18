@@ -121,8 +121,6 @@ select = [
 ignore = [
     "D203",   # one-blank-line-before-class (conflicts with D211)
     "D213",   # multi-line-summary-second-line (conflicts with D212)
-    "ANN101", # deprecated: missing-type-self
-    "ANN102", # deprecated: missing-type-cls
     "ANN401", # Allow `typing.Any` where genuinely appropriate
 ]
 

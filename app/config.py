@@ -42,6 +42,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        # Empty values in `.env` (e.g. `FILTER_WORKERS=`) fall back to the
+        # default rather than failing integer parsing. Lets .env.example ship
+        # with blank placeholders for optional fields.
+        env_ignore_empty=True,
     )
 
     workflow_api_url: str = Field(default="http://localhost:9000")
@@ -53,7 +57,7 @@ class Settings(BaseSettings):
 
     max_relevant_images: PositiveInt = Field(default=20)
     max_rank_input: PositiveInt = Field(default=500)
-    filter_workers: int | None = Field(default=None)
+    filter_workers: PositiveInt | None = Field(default=None)
 
     max_fetch_failure_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
     assume_sorted_stream: bool = Field(default=True)

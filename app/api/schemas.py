@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, model_validator
 
 
 class EnrichedQARequest(BaseModel):
@@ -65,10 +65,10 @@ class Meta(BaseModel):
     """
 
     request_id: str
-    images_considered: int = Field(ge=0)
-    images_relevant: int = Field(ge=0)
-    errors: dict[str, int] = Field(default_factory=dict)
-    latency_ms: dict[str, int] = Field(default_factory=dict)
+    images_considered: NonNegativeInt
+    images_relevant: NonNegativeInt
+    errors: dict[str, NonNegativeInt] = Field(default_factory=dict)
+    latency_ms: dict[str, NonNegativeInt] = Field(default_factory=dict)
 
 
 class EnrichedQAResponse(BaseModel):

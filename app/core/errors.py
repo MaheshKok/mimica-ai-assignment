@@ -1,7 +1,7 @@
 """Port-level exception hierarchy for the enriched QA pipeline.
 
 These are raised by adapters (``StorageFetchError``, ``WorkflowUpstreamError``)
-or by the orchestrator (``PartialFailureThresholdExceededErrorError``). Route
+or by the orchestrator (``PartialFailureThresholdExceededError``). Route
 exception handlers catch them and produce the uniform error envelope defined
 in ``architect.md`` section 7.
 
@@ -31,7 +31,7 @@ class StorageFetchError(EnrichedQAError):
 
     Adapters wrap HTTP 404s, 5xx responses, and transport failures in this
     error. The orchestrator catches it, increments a counter, and either
-    continues or triggers :class:`PartialFailureThresholdExceededErrorError`.
+    continues or triggers :class:`PartialFailureThresholdExceededError`.
 
     Attributes:
         image_id: The image that failed to fetch.
