@@ -44,8 +44,10 @@ repos:
       - id: mypy
         args: [--config-file=pyproject.toml]
         additional_dependencies:
+          - fastapi>=0.111
           - pydantic>=2.7
           - pydantic-settings>=2.3
+          - structlog>=24.1
           - types-requests
         pass_filenames: false
         files: ^(app|mock_services)/

@@ -156,3 +156,65 @@ mypy: Success — no issues found in 19 source files
 - **`# noqa: B042`** on `StorageFetchError.__init__` was lost to formatter stripping. Moved the waiver to `.flake8`'s `per-file-ignores` so the formatter can't touch it. Rationale: these exceptions are consumed at HTTP handler boundaries, never pickled or `copy.copy`'d.
 - **`# noqa: TC003`** on `uuid.UUID` import in `app/api/schemas.py`. Pydantic resolves field annotations at runtime; moving `UUID` behind `TYPE_CHECKING` would break schema construction. All other `TC001/TC003` hits moved into `TYPE_CHECKING` blocks where annotations are genuinely lazy.
 - **Test-layer discipline enforced.** Every test file reads only the signature + docstring of its target module. The test-writing process treated the implementation as opaque.
+
+### Post-review fixes (commit `2037266`)
+
+Codex adversarial review surfaced four issues addressed before starting Phase 3:
+
+- `SettingsConfigDict(env_ignore_empty=True)` — blank optional values in `.env.example` (`FILTER_WORKERS=`, `OTEL_EXPORTER_OTLP_ENDPOINT=`) now fall back to defaults instead of failing integer parsing. Added `TestEnvFileLoading::test_env_example_loads_without_error`.
+- `filter_workers: PositiveInt | None` — zero and negative values now rejected at load time (they'd crash `ProcessPoolExecutor(max_workers=...)` in Phase 6 otherwise).
+- `Meta.errors` / `Meta.latency_ms` typed `dict[str, NonNegativeInt]` — negative counters or durations can no longer cross the HTTP boundary.
+- `app/core/errors.py` module docstring: fixed `ExceededErrorError` double-rename artefact.
+- `pyproject.toml`: removed ANN101/ANN102 from ruff's ignore list (rules deleted in modern ruff, emit noise warning when listed).
+
+Net: **134 tests** (was 126), 100% coverage, all gates still green.
+
+---
+
+## Phase 3 — Vertical slice (with fakes)
+
+### Status
+
+Complete. **Gate passed.** `make run` + `curl` returns 200 with a deterministic answer produced by the fake pipeline end-to-end.
+
+### What shipped
+
+| Module | Surface |
+|---|---|
+| `app/deps.py` | `Ports` dataclass (workflow/storage/relevance bundle) + `get_settings`, `get_ports` providers. Default wiring uses the Phase 2 fakes with 3 demo refs so `curl` returns non-empty data. |
+| `app/core/orchestrator.py` | `run(req, ports, config, request_id) -> EnrichedQAResponse`. Implements stream+filter, empty-window short-circuit, bounded-concurrency fetch, partial-failure counting + threshold raise, rank, QA, latency metering. Private helpers: `_stream_and_filter` (respects `ASSUME_SORTED_STREAM`), `_fetch_all` (asyncio semaphore). |
+| `app/api/routes.py` | `POST /enriched-qa` handler. Generates `request_id` via `uuid4()`, injects `Ports`/`Settings` via `Depends`. |
+| `app/main.py` | FastAPI factory `create_app()`, empty-body `lifespan` context (Phase 4 adds `httpx.AsyncClient`, Phase 6 adds `ProcessPoolExecutor`), and 4 exception handlers (RequestValidationError→400, PartialFailureThresholdExceededError→502, WorkflowUpstreamError→502, TimeoutError→504) all returning the `{error, detail, request_id}` envelope. |
+
+### Tests
+
+171 total (was 134 after Phase 2). New files:
+
+- `tests/unit/test_orchestrator.py` — 22 tests covering happy path, empty window (incl. verifying *no* calls to storage/ranker/QA via call counters), boundary inclusivity (`timestamp == from` included, `== to` excluded), sorted-stream short-circuit vs unsorted drain (using a custom `_CountingWorkflow` fake that reports how many refs were drawn), partial failure below/at/above threshold, upstream-error propagation (stream + qa variants), ranker-order preservation in `qa_answer`, concurrency cap verified via a `_TrackingStorage` that records peak in-flight fetches.
+- `tests/unit/test_routes.py` — 9 tests: literal `"from"` key round-trip, all four validation failure paths mapping to **400** (override of FastAPI's 422 default), `PartialFailureThresholdExceededError`→502 envelope, `WorkflowUpstreamError`→502 envelope, envelope-shape-is-exactly-`{error, detail, request_id}` assertion.
+- `tests/unit/test_main.py` — 3 tests: `TimeoutError`→504 mapping, `lifespan` startup/shutdown via `with TestClient(app)`, `create_app()` returns a fresh instance each call.
+- `tests/unit/test_deps.py` — 4 tests: `get_settings`/`get_ports` return expected types, cached singletons, demo refs match demo storage ids (prevents a silent drift that would make `curl` fail with a partial-failure error).
+
+### Verification
+
+```
+make test       171 passed in 1.31s
+make test-cov   100% coverage (gate 93%)
+make lint       ruff + flake8 both clean
+make typecheck  mypy clean (23 source files, strict)
+pre-commit run --all-files  all 11 hooks pass
+make run        started uvicorn on :8001
+curl -sS -X POST http://localhost:8001/enriched-qa -d '{...}' -> HTTP 200 + demo answer
+curl -sS -X POST ... -d '{"from": 10, "to": 10, ...}'         -> HTTP 400 + {error, detail, request_id}
+```
+
+### Deviations from plan.md
+
+- Plan calls out `app/main.py` owning the `httpx.AsyncClient` "from Phase 4" inside `lifespan`. Phase 3 ships the `lifespan` *shape* but no resources — resources arrive in Phase 4. The docstring on `lifespan` spells this out so the handoff is explicit.
+- Default demo refs live in `app/deps._demo_ports()` rather than baked into the fake classes. Keeps the fakes test-friendly (construct empty, populate inline) while still giving `make run` a meaningful payload.
+- One inline `# noqa: TC001` on `from app.config import Settings` in `app/api/routes.py`. FastAPI resolves dependency-injected parameter annotations at runtime via `get_type_hints()`; moving `Settings` behind `TYPE_CHECKING` makes FastAPI treat `config` as a query parameter, which was caught by the first post-commit test run. Documented next to the noqa.
+- Pre-commit mypy needed `fastapi` in `additional_dependencies` so decorator types resolve. Installed mypy was fine because `uv sync` ships the full runtime deps, but pre-commit's isolated env didn't, which mypy flagged as `Untyped decorator makes function … untyped`. Adding FastAPI, structlog, and pydantic-settings to the hook's env fixed it.
+
+### Acknowledged but not acted on
+
+- `RequestValidationError.errors()` is rendered via `str(...)` in the 400 envelope's `detail`. This produces a Python repr with quoted field names; not elegant. Replacing with a structured list is Phase 9 polish.
