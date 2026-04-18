@@ -500,13 +500,30 @@ class TestSampleUniformOverWindow:
         bucket_widths = [r.timestamp // 10 for r in out]
         assert sorted(bucket_widths) == list(range(10))
 
-    def test_clustered_input_returns_fewer_than_max(self) -> None:
-        # If every ref falls in the same bucket, only one is returned.
-        # The contract says "at most max_input", not "exactly max_input".
+    def test_clustered_input_fills_up_to_max_via_pass_two(self) -> None:
+        # If every ref falls in the same bucket, pass 1 picks one and
+        # pass 2 fills the remaining slots from the leftovers in stream
+        # order. The contract now uses the full budget even on clusters.
         refs = [ScreenshotRef(timestamp=5, image_id=f"i-{i}") for i in range(50)]
         out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
-        assert len(out) == 1
-        assert out[0].image_id == "i-0"  # first-wins per bucket
+        assert len(out) == 10
+        # Pass 1 picks i-0 (first seen); pass 2 fills with i-1..i-9 in order.
+        assert [r.image_id for r in out] == [f"i-{i}" for i in range(10)]
+
+    def test_partly_clustered_uses_budget_without_losing_spread(self) -> None:
+        # 5 refs spread across buckets 0..4, then 20 more clustered in bucket 0.
+        # Pass 1 takes one from each of the 5 buckets hit; pass 2 fills the
+        # remaining 5 slots from the cluster leftovers.
+        spread = [ScreenshotRef(timestamp=i * 10, image_id=f"spread-{i}") for i in range(5)]
+        cluster = [ScreenshotRef(timestamp=0, image_id=f"cluster-{i}") for i in range(20)]
+        refs = spread + cluster
+        out = _sample_uniform_over_window(refs, from_=0, to=100, max_input=10)
+        assert len(out) == 10
+        # Every original bucket must still be represented.
+        assert any(r.image_id == "spread-0" for r in out)
+        assert any(r.image_id == "spread-4" for r in out)
+        # Pass 2 pulled from cluster leftovers.
+        assert sum(1 for r in out if r.image_id.startswith("cluster-")) == 5
 
     def test_empty_input_returns_empty(self) -> None:
         assert _sample_uniform_over_window([], from_=0, to=100, max_input=10) == []

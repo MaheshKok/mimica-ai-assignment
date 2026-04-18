@@ -92,12 +92,54 @@ class TestTimeoutMapping:
 
 class TestLifespan:
     def test_context_runs_startup_and_shutdown(self) -> None:
-        """`with TestClient(app)` exercises the lifespan enter + exit path."""
+        """``with TestClient(app)`` exercises the lifespan enter + exit path."""
         from app.main import app
 
         with TestClient(app):
             # If lifespan raises, the context manager propagates here.
             pass
+
+    def test_wires_real_http_adapters_and_resources(self) -> None:
+        """Lifespan must construct the HTTP adapters, not accidentally ship fakes.
+
+        A regression that silently reverted to ``build_demo_ports`` would
+        pass the "doesn't raise" smoke check. This test asserts the
+        concrete adapter classes, the presence of the process-wide
+        semaphore, and that the http client is open during the request.
+        """
+        import asyncio
+
+        from app.adapters.storage_http import HttpxScreenshotStorageClient
+        from app.adapters.workflow_http import HttpxWorkflowServicesClient
+        from app.main import app
+
+        with TestClient(app):
+            assert isinstance(app.state.ports.workflow, HttpxWorkflowServicesClient), (
+                "lifespan must wire the HTTP workflow adapter, not a fake"
+            )
+            assert isinstance(app.state.ports.storage, HttpxScreenshotStorageClient), (
+                "lifespan must wire the HTTP storage adapter, not a fake"
+            )
+            assert isinstance(app.state.global_fetch_semaphore, asyncio.Semaphore), (
+                "process-wide storage semaphore must be on app.state"
+            )
+            assert not app.state.http_client.is_closed, (
+                "http client must be open while the lifespan context is active"
+            )
+
+    def test_closes_http_client_on_shutdown(self) -> None:
+        """Lifespan's finally branch must ``aclose()`` the shared client.
+
+        Without this, rapid reloads/tests leak transports. Assertion is
+        checked *after* the TestClient context exits so we know the
+        shutdown path actually ran.
+        """
+        from app.main import app
+
+        with TestClient(app):
+            client = app.state.http_client
+            assert not client.is_closed
+        assert client.is_closed, "lifespan must close the shared http client on shutdown"
 
 
 class TestRootFactory:

@@ -17,6 +17,7 @@ does not see:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 import httpx
 
@@ -70,7 +71,11 @@ class HttpxScreenshotStorageClient:
                 error. ``StorageFetchError.cause`` preserves the original
                 exception so higher layers can classify if needed.
         """
-        url = f"{self._base_url}/images/{image_id}"
+        # image_id is opaque upstream-derived text. It may contain ``/``,
+        # ``?``, ``#`` or other characters that httpx would otherwise
+        # interpret as URL syntax; percent-encode the whole thing as a
+        # single path segment so the identifier round-trips verbatim.
+        url = f"{self._base_url}/images/{quote(image_id, safe='')}"
         async with self._global_sem:
             try:
                 response = await self._client.get(url)

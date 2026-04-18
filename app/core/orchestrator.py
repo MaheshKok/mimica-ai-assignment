@@ -240,13 +240,20 @@ def _sample_uniform_over_window(
     to: int,
     max_input: int,
 ) -> list[ScreenshotRef]:
-    """Downsample ``refs`` uniformly over the ``[from_, to)`` time window.
+    """Downsample ``refs`` over the ``[from_, to)`` window with two passes.
 
-    Partitions the window into ``max_input`` equal-width buckets and keeps
-    the first ref encountered for each bucket. This preserves the caller's
-    iteration order (stream order), guarantees a result size of at most
-    ``max_input``, and - when refs are distributed across the window -
-    yields a representative sample instead of a blind head-N slice.
+    Pass 1 picks the first ref seen in each of ``max_input`` equal-width
+    time buckets. This guarantees temporal spread: no part of the window
+    is silently dropped when refs cluster elsewhere.
+
+    Pass 2 fills any remaining slots (up to ``max_input``) from the refs
+    that were skipped by pass 1, preserving their stream order. Without
+    this pass, a dense burst in a single bucket would collapse to one
+    ref even when the budget allows more.
+
+    Pass 1 alone is temporally clean but wasteful; pass 2 alone is
+    dense-first and loses spread. Running both uses the full budget
+    while still front-loading representation.
 
     Args:
         refs: Filtered refs from the stream. May be empty.
@@ -255,23 +262,33 @@ def _sample_uniform_over_window(
         max_input: Maximum allowed size of the returned list. Must be > 0.
 
     Returns:
-        A list of at most ``max_input`` refs. Returned unchanged when
-        already at or below the cap.
+        A list of at most ``max_input`` refs in stream order. Returned
+        unchanged when already at or below the cap. When ``len(refs) >
+        max_input`` the output length equals ``max_input`` (pass 2
+        always has enough leftovers to fill).
     """
     if len(refs) <= max_input:
         return refs
     # Caller (orchestrator) has already validated the window is non-empty
     # and that this path is only reached when refs > 0.
     bucket_width = (to - from_) / max_input
-    selected: dict[int, ScreenshotRef] = {}
+    selected: list[ScreenshotRef] = []
+    leftovers: list[ScreenshotRef] = []
+    seen_buckets: set[int] = set()
     for ref in refs:
         idx = int((ref.timestamp - from_) / bucket_width)
         # Clamp the last bucket: timestamp == to-1 (nearly at edge) may
         # round to `max_input`. Clip to the last bucket to avoid a stray
-        # key that'd make the result larger than max_input in pathological
-        # float rounding.
+        # key that'd make the first pass exceed max_input via rounding.
         if idx >= max_input:
             idx = max_input - 1
-        if idx not in selected:
-            selected[idx] = ref
-    return list(selected.values())
+        if idx not in seen_buckets:
+            seen_buckets.add(idx)
+            selected.append(ref)
+        else:
+            leftovers.append(ref)
+    # Pass 2: fill remaining slots from leftovers in stream order.
+    remaining = max_input - len(selected)
+    if remaining > 0:
+        selected.extend(leftovers[:remaining])
+    return selected

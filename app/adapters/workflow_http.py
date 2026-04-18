@@ -119,18 +119,37 @@ class HttpxWorkflowServicesClient:
 def _parse_ndjson_line(line: str) -> ScreenshotRef | None:
     """Parse a single NDJSON line into a :class:`ScreenshotRef`.
 
-    Maps the upstream ``screenshot_url`` field onto ``image_id``. Any parse
-    or schema error is logged at WARNING and returns ``None`` so the caller
-    skips the row without aborting the stream.
+    Maps the upstream ``screenshot_url`` field onto ``image_id``. The parser
+    is strict on purpose: any type mismatch or schema drift (``None``,
+    booleans masquerading as ints, floats where ints are expected, numeric
+    ids, empty strings, non-object payloads) is logged at WARNING and
+    returns ``None``. Coercion is **not** used here because silent
+    ``int(True) == 1`` / ``str(None) == "None"`` conversions would promote
+    upstream garbage into storage fetches and QA inputs. Malformed rows
+    must be skipped, never rewritten.
     """
     if not line or not line.strip():
         return None
     try:
-        row = json.loads(line)
-        timestamp = int(row["timestamp"])
-        image_id = str(row["screenshot_url"])
-    except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-        logger.warning("skipping malformed NDJSON line: %s", exc)
+        row: object = json.loads(line)
+    except json.JSONDecodeError as exc:
+        logger.warning("skipping NDJSON line that is not valid JSON: %s", exc)
+        return None
+    if not isinstance(row, dict):
+        logger.warning("skipping NDJSON row that is not a JSON object: %r", row)
+        return None
+    timestamp = row.get("timestamp")
+    image_id = row.get("screenshot_url")
+    # bool is a subclass of int in Python; reject it explicitly so
+    # `timestamp: true` is not silently treated as ``1``.
+    if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+        logger.warning("skipping NDJSON row with non-integer timestamp: %r", timestamp)
+        return None
+    if not isinstance(image_id, str) or not image_id:
+        logger.warning(
+            "skipping NDJSON row with missing or non-string screenshot_url: %r",
+            image_id,
+        )
         return None
     return ScreenshotRef(timestamp=timestamp, image_id=image_id)
 

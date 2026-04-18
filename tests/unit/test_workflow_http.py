@@ -157,6 +157,151 @@ class TestStreamProject:
         finally:
             await client.aclose()
 
+    async def test_skips_row_with_null_screenshot_url(self) -> None:
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = (
+                b'{"timestamp": 1, "screenshot_url": null}\n'
+                b'{"timestamp": 2, "screenshot_url": "keep"}\n'
+            )
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["keep"]
+        finally:
+            await client.aclose()
+
+    async def test_skips_row_with_numeric_screenshot_url(self) -> None:
+        # `str(42) == "42"` would coerce an int into an image id; reject instead.
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = (
+                b'{"timestamp": 1, "screenshot_url": 42}\n'
+                b'{"timestamp": 2, "screenshot_url": "good"}\n'
+            )
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["good"]
+        finally:
+            await client.aclose()
+
+    async def test_skips_row_with_empty_screenshot_url(self) -> None:
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = (
+                b'{"timestamp": 1, "screenshot_url": ""}\n'
+                b'{"timestamp": 2, "screenshot_url": "ok"}\n'
+            )
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["ok"]
+        finally:
+            await client.aclose()
+
+    async def test_skips_row_with_bool_timestamp(self) -> None:
+        # bool is an int subclass in Python; `int(True) == 1` would silently
+        # produce ScreenshotRef(timestamp=1, ...). Must be rejected.
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = (
+                b'{"timestamp": true, "screenshot_url": "a"}\n'
+                b'{"timestamp": false, "screenshot_url": "b"}\n'
+                b'{"timestamp": 5, "screenshot_url": "c"}\n'
+            )
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["c"]
+        finally:
+            await client.aclose()
+
+    async def test_skips_row_with_null_timestamp(self) -> None:
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = (
+                b'{"timestamp": null, "screenshot_url": "a"}\n'
+                b'{"timestamp": 5, "screenshot_url": "b"}\n'
+            )
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["b"]
+        finally:
+            await client.aclose()
+
+    async def test_skips_row_with_float_timestamp(self) -> None:
+        # `int(1.9) == 1` would quietly truncate. Must be rejected.
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = (
+                b'{"timestamp": 1.9, "screenshot_url": "a"}\n'
+                b'{"timestamp": 2, "screenshot_url": "b"}\n'
+            )
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["b"]
+        finally:
+            await client.aclose()
+
+    async def test_skips_row_with_string_timestamp(self) -> None:
+        # `int("5") == 5` would coerce. Must be rejected as schema drift.
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = (
+                b'{"timestamp": "5", "screenshot_url": "a"}\n'
+                b'{"timestamp": 7, "screenshot_url": "b"}\n'
+            )
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["b"]
+        finally:
+            await client.aclose()
+
+    async def test_skips_array_payload(self) -> None:
+        # Array rows are not objects; must be skipped.
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = b'[1, 2, 3]\n{"timestamp": 1, "screenshot_url": "a"}\n'
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["a"]
+        finally:
+            await client.aclose()
+
+    async def test_skips_string_payload(self) -> None:
+        async def handler(_: httpx.Request) -> httpx.Response:
+            body = b'"just a string"\n{"timestamp": 1, "screenshot_url": "a"}\n'
+            return httpx.Response(200, content=body)
+
+        client = _client(handler)
+        try:
+            adapter = HttpxWorkflowServicesClient(client, base_url="http://workflow.test")
+            refs = [r async for r in adapter.stream_project(uuid4())]
+            assert [r.image_id for r in refs] == ["a"]
+        finally:
+            await client.aclose()
+
     async def test_stream_url_includes_project_id(self) -> None:
         captured: list[str] = []
 

@@ -290,3 +290,23 @@ live uvicorn   unreachable upstream -> 502 workflow_upstream_failure envelope
 ### Known gap (Phase 5 will resolve)
 
 - `make run` without Phase 5's mock services running returns `502 workflow_upstream_failure` because the HTTP adapter can't reach `localhost:9000`/`:9100`. This is exactly what `plan.md` predicted and why Phase 5 brings up the separable mock services.
+
+### Post-review fixes (commit pending)
+
+Both adversarial reviewers converged on two real adapter bugs plus three polish items. All five fixed:
+
+1. **[P1] Storage image_id URL-escaped.** `get_image` now builds the URL with `urllib.parse.quote(image_id, safe='')`. Probed inputs that would otherwise be unsafe: `"../escape.png"` no longer reshapes the path; `"img.png?token=secret"` no longer leaks into the query; `/`, `#`, space, `%`, `+`, `&`, and unicode are all percent-encoded. `StorageFetchError.image_id` still carries the *unescaped* original so logs and `meta.errors` reflect what the caller actually asked for. Nine new adversarial URL-encoding tests in `test_storage_http.py`.
+2. **[P2] NDJSON parser strict-checks field types.** `_parse_ndjson_line` no longer calls `int(...)` / `str(...)`. It requires the row to be a JSON object; rejects `bool` (despite being an `int` subclass), `None`, floats, numeric strings, non-string `screenshot_url`, empty strings, and non-object payloads (arrays, strings). Eight new adversarial NDJSON tests in `test_workflow_http.py`.
+3. **[P3] Two-pass sampling in `_sample_uniform_over_window`.** Pass 1 picks one ref per time bucket (temporal spread). Pass 2 fills remaining slots from cluster leftovers in stream order. Previously 500 refs in one bucket yielded 1 output; now yields `max_input`. Two new/rewritten tests assert both the spread-preserving behaviour and the budget-utilising fill.
+4. **[P3] Lifespan test asserts real wiring.** Two new tests: one asserts `app.state.ports.{workflow,storage}` are the actual `HttpxWorkflowServicesClient` / `HttpxScreenshotStorageClient` (guards against a silent revert to demo fakes); another asserts `http_client.is_closed` is `True` after the `TestClient` context exits (guards against a missing `aclose()`). `global_fetch_semaphore` presence also asserted.
+5. **[P3] README updated.** Removed Phase 1 scaffold wording. Current state now describes Phase 4: `make run` boots the real HTTP adapters, returns `502 workflow_upstream_failure` until Phase 5 mocks arrive, and the expected envelope is documented inline. Test entry points listed per file.
+
+**Deliberately not acted on:** codex-1's suggestion to "default to `build_demo_ports` until Phase 5 mocks exist" or "ship the mocks in this change". The plan (`plan.md` Phase 4→5) intentionally split real adapters from mock services. Reverting to demo defaults would collapse that boundary; shipping mocks here would be a Phase 5 merge. Fix #5 is the right answer — document the intended state so evaluators aren't surprised.
+
+### Verification
+
+- 237 tests pass (up from 216; +21 new adversarial tests).
+- 100% coverage, gate 93%.
+- ruff + flake8 + mypy all clean.
+- Live probe confirms: `get_image("../escape.png")` now hits `/images/..%2Fescape.png`; `get_image("img.png?token=secret")` hits `/images/img.png%3Ftoken%3Dsecret`; both no longer leak path/query semantics.
+- NDJSON bodies like `{"timestamp": true, ...}` and `{"timestamp": 1, "screenshot_url": null}` now yield zero refs instead of `ScreenshotRef(timestamp=1, image_id="None")`.
