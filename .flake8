@@ -1,0 +1,17 @@
+[flake8]
+# Flake8 runs parallel to Ruff as a redundancy net.
+# Ruff owns most lint rules; flake8 here enforces the plugin set requested.
+max-line-length = 100
+extend-select = B,C4,SIM,D,ANN,PT,TC,N
+extend-ignore = E203,E501,W503,D203,D213,ANN101,ANN102,ANN401
+docstring-convention = google
+per-file-ignores =
+    tests/*:D100,D101,D102,D103,D104,ANN001,ANN201
+    mock_services/*:D100,D104
+exclude =
+    .git,
+    .venv,
+    __pycache__,
+    build,
+    dist,
+    docs,

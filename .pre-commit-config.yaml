@@ -1,0 +1,49 @@
+# Pre-commit hooks. Run with `pre-commit run --all-files` or automatically on commit.
+# Ruff runs first (fast, auto-fixes). Flake8 + plugins run after as a second opinion.
+# Mypy enforces type hints on the application code.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.1.1
+    hooks:
+      - id: flake8
+        additional_dependencies:
+          - flake8-bugbear==24.8.19
+          - flake8-comprehensions==3.15.0
+          - flake8-simplify==0.21.0
+          - flake8-docstrings==1.7.0
+          - flake8-annotations==3.1.1
+          - flake8-pytest-style==2.0.0
+          - flake8-type-checking==2.9.1
+          - pep8-naming==0.14.1
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        args: [--config-file=pyproject.toml]
+        additional_dependencies:
+          - pydantic>=2.7
+          - pydantic-settings>=2.3
+          - types-requests
+        pass_filenames: false
+        files: ^(app|mock_services)/

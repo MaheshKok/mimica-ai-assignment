@@ -69,9 +69,9 @@ The Workflow Services adapter is responsible for mapping the upstream `screensho
 The upstream `/projects/{projectId}/stream` endpoint takes no time parameters. We must therefore be explicit about how we consume it:
 
 - **Assumption: the stream is finite and sorted by `timestamp` ascending.** If this holds, we can stop reading as soon as we see `timestamp >= to`, bounding work per request.
-- If the assumption is wrong (unsorted or infinite), the service falls back to consuming until EOF, constrained by the overall request budget. A request that does not complete within `REQUEST_TIMEOUT_MS` returns `504`.
+- The assumption is toggleable via the `ASSUME_SORTED_STREAM` config flag (default `True`). Setting it to `False` makes the orchestrator drain to EOF, constrained by the overall request budget. A request that does not complete within `REQUEST_TIMEOUT_MS` returns `504`.
 - Window semantics: `[from, to)` — inclusive at `from`, exclusive at `to`. Documented in the OpenAPI response and the error message for out-of-window empty results.
-- Malformed NDJSON lines are logged and skipped; they do not abort the request.
+- Malformed NDJSON lines are logged and skipped at the **Workflow HTTP adapter**; the orchestrator never sees raw lines. Tests for this behaviour live at the adapter layer.
 
 This assumption is called out in `README.md` so an evaluator can challenge it.
 
@@ -86,11 +86,13 @@ All core dependencies are expressed as `typing.Protocol`s in `app/ports/`. Concr
 ```python
 class WorkflowServicesClient(Protocol):
     def stream_project(self, project_id: UUID) -> AsyncIterator[ScreenshotRef]: ...
-    async def qa_answer(self, question: str, relevant_images: list[str]) -> Answer: ...
+    async def qa_answer(self, question: str, relevant_images: list[str]) -> str: ...
 ```
 
 - `stream_project` returns an async iterator so NDJSON rows are consumed as they arrive.
+- `qa_answer` returns the upstream `answer` field directly as a `str`. No `Answer` wrapper — the value is a string already.
 - The HTTP adapter maps the upstream `screenshot_url` field onto `ScreenshotRef.image_id`.
+- Transport or 5xx failures raise `WorkflowUpstreamError`; malformed NDJSON lines are logged and skipped inside the adapter.
 
 ### `ScreenshotStorageClient`
 
@@ -113,7 +115,7 @@ class RelevanceRanker(Protocol):
     ) -> list[str]: ...
 ```
 
-- `ScreenshotWithBytes = (image_id: str, data: bytes)`.
+- `ScreenshotWithBytes(ref: ScreenshotRef, data: bytes)` — the wrapped `ref` keeps the timestamp available to the ranker, and keeps `ScreenshotRef` (the type flowing through the pipeline before fetch) as the thing sampling operates on. See `plan.md` Phase 4 pre-fetch sampling.
 - Returns at most `top_k` `image_id`s, **ordered most relevant first**.
 - "Most relevant" is a ranking problem, not a boolean filter. The default `top_k` is configurable via `MAX_RELEVANT_IMAGES` (default 20).
 - Implementation routes the CPU work through `loop.run_in_executor(ProcessPoolExecutor, ...)`. Callers never see the executor.
@@ -131,8 +133,8 @@ Under the stated burst (up to 10 concurrent requests, each up to 500 images), pe
 Additional rules:
 
 - NDJSON is parsed line-by-line via `aiter_lines()`; rows outside `[from, to)` are dropped without ever holding the full response.
-- One process-wide `ProcessPoolExecutor` sized to `os.cpu_count()` handles ranking. Workers use `max_tasks_per_child` to bound memory growth.
-- Ranker input is capped (`MAX_RANK_INPUT`, default 500 images) before pickling. If the input exceeds the cap we sample uniformly over time. This is a pragmatic choice for this challenge — pickling 500 image blobs into a worker is not free, and the real system would co-locate or stream bytes differently.
+- One process-wide `ProcessPoolExecutor` sized to `os.cpu_count()` handles ranking. Worker recycling (`max_tasks_per_child`) is production hardening and deferred for this challenge.
+- Ranker input is capped (`MAX_RANK_INPUT`, default 500). Sampling happens on the `list[ScreenshotRef]` **before** fetch (see `plan.md` Phase 4), not after — so timestamps are still present and we avoid fetching images we'd immediately discard. Sampling is uniform over the `[from, to)` window. This is a pragmatic choice for this challenge — pickling 500 image blobs into a worker is not free, and the real system would co-locate or stream bytes differently.
 - Every outbound hop has an explicit timeout. An overall request budget is enforced at the handler via `asyncio.timeout(...)`. Note: `asyncio.timeout` cancels the awaiting coroutine but cannot kill in-flight CPU work inside a worker process; bounding input size is what keeps ranker cost predictable.
 
 ---
@@ -211,10 +213,10 @@ Status codes: `400` for validation, `502` for upstream failure or excessive part
 
 Silent data loss in a QA context produces confidently wrong answers. The policy is explicit:
 
-- Each storage fetch that fails (404, timeout, 5xx) is recorded but does not abort the request.
+- Each storage fetch that fails (404, timeout, 5xx) is recorded but does not abort the request. The adapter raises `StorageFetchError`; the orchestrator catches it and increments a counter.
 - Failures are counted and exposed in `meta.errors` (e.g. `storage_fetch_failed: 3`).
-- **Fail-fast threshold:** if more than 20% of fetches fail (configurable via `MAX_FETCH_FAILURE_RATIO`), the request returns `502` rather than answering from a degraded set.
-- If zero screenshots remain in `[from, to)` after streaming, return a `200` with `answer: ""` (or a service-defined "no data" string) and `images_considered: 0`. Callers can distinguish this from an upstream error by status code.
+- **Fail-fast threshold:** if `total_fetches > 0` *and* `failed / total_fetches > MAX_FETCH_FAILURE_RATIO` (default 0.2), the orchestrator raises `PartialFailureThresholdExceeded` and the request returns `502`. The `total > 0` guard is essential — without it, an empty window would divide by zero.
+- **Empty-window short-circuit:** if zero screenshots remain in `[from, to)` after streaming, return `200` with `answer: ""`, `images_considered: 0`, empty `errors`, and **skip fetch, rank, and QA entirely**. This is the same path that makes the threshold safe (nothing to divide, nothing to fail).
 
 ---
 
@@ -261,6 +263,7 @@ Env vars read via `pydantic-settings`:
 | `MAX_RELEVANT_IMAGES`         | `20`                     | Top-K cap for relevance ranker output.             |
 | `MAX_RANK_INPUT`              | `500`                    | Ranker input cap; oversampled sets are downsampled.|
 | `MAX_FETCH_FAILURE_RATIO`     | `0.2`                    | Partial-failure threshold before 502.              |
+| `ASSUME_SORTED_STREAM`        | `true`                   | If true, stop reading the stream at `timestamp >= to`. If false, drain to EOF. |
 | `FILTER_WORKERS`              | `os.cpu_count()`         | Process pool size.                                 |
 | `REQUEST_TIMEOUT_MS`          | `15000`                  | Total per-request budget.                          |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | (unset -> console)       | OTLP destination.                                  |
@@ -273,20 +276,35 @@ Adapters are constructed once at startup. `app/deps.py` exposes FastAPI dependen
 
 Tests are derived from the contract (signatures, this architecture), not by mirroring implementation code.
 
-### Unit Tests (fakes implementing each Protocol)
+Tests are split by layer to keep each suite honest about what it owns (see `plan.md` Phase 8 for the full matrix):
 
-Adversarial cases the orchestrator must pass:
+### Orchestrator unit tests (Protocol fakes only)
 
-- Empty stream (`images_considered == 0`, 200 with empty answer).
-- Zero rows in `[from, to)` (all before `from` or at/after `to`).
-- `from == to` (rejected at validation).
+- Empty stream / empty window (`images_considered == 0`, 200 with empty answer, **no calls to storage/ranker/QA**).
+- Zero rows in `[from, to)` (all before `from` or at/after `to`) — same behaviour as empty stream.
 - Boundary inclusivity: `timestamp == from` included, `timestamp == to` excluded.
+- Sorted-stream short-circuit triggers under `ASSUME_SORTED_STREAM=True`; drains to EOF under `False`.
 - Storage 404s below threshold: dropped, counted in `meta.errors`, request succeeds.
-- Storage failures above threshold: 502 with failure count.
-- Workflow upstream 5xx: 502.
-- Malformed NDJSON line: skipped and logged, request continues.
-- Huge image count (500): peak concurrency stays bounded; semaphore does not deadlock.
+- Storage failures above threshold: `PartialFailureThresholdExceeded` → 502.
+- Orchestrator propagates `WorkflowUpstreamError` unchanged (the 5xx→error mapping is the adapter's job, tested there).
 - Ranker returns IDs in a known order; orchestrator preserves that order when calling `qa_answer`.
+
+### Adapter unit tests (`httpx.MockTransport`)
+
+- Workflow: malformed NDJSON line skipped; subsequent valid rows still yielded.
+- Workflow: upstream `screenshot_url` maps to `ScreenshotRef.image_id`.
+- Workflow: non-2xx (including 5xx) → `WorkflowUpstreamError`.
+- Storage: 404 / 5xx / timeout → `StorageFetchError`.
+
+### Wire-up tests (FastAPI TestClient + `dependency_overrides`)
+
+- POST with literal `"from"` body key returns 200 (alias round-trip).
+- POST with `from == to` returns 400 (handler overrides FastAPI's default 422).
+- `PartialFailureThresholdExceeded` maps to 502.
+
+### Concurrency / capacity
+
+- Huge image count (500): peak concurrency stays bounded; semaphore does not deadlock.
 
 ### Integration Tests
 
@@ -295,7 +313,7 @@ Adversarial cases the orchestrator must pass:
 
 ### CPU-Bound Ranker Tests
 
-- Verify the ranker runs off the event loop: measure event-loop lag during a large `rank()` call and assert it stays under a small threshold.
+- Verify the ranker actually runs in a child process (`multiprocessing.current_process().name != "MainProcess"` inside the CPU function, observed via a test hook). Event-loop lag measurement is more rigorous but overkill for this challenge and is deferred (see `plan.md`).
 - Verify output is deterministic and ordered for a given input and question.
 
 ### Burst / Concurrency Tests

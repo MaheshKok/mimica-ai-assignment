@@ -1,3 +1,47 @@
+# Editors / IDE / tooling
 .idea/
 .claude/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
 .DS_STORE
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Type / lint caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Environment
+.env
+.env.local
+
+# Build artifacts
+*.log
+*.sqlite3
