@@ -74,6 +74,38 @@ class WorkflowUpstreamError(EnrichedQAError):
         self.cause = cause
 
 
+class RelevanceRankerError(EnrichedQAError):
+    """Raised when the CPU-bound relevance ranker cannot produce a result.
+
+    Covers ``concurrent.futures.process.BrokenProcessPool`` (a worker
+    crashed or was killed mid-task) and ``RuntimeError`` from
+    ``run_in_executor`` against a pool whose shutdown has already been
+    scheduled. The route handler maps this to HTTP 503 so the failure is
+    visible to the caller as a retryable infrastructure issue rather
+    than a generic 500.
+
+    Deliberately does **not** attempt to recreate the underlying pool.
+    Pool recreation concurrent with in-flight requests is a state
+    problem this scope does not solve; the production answer is a
+    readiness probe that marks the process unhealthy so the orchestrator
+    restarts it.
+
+    Attributes:
+        cause: The underlying exception (``BrokenProcessPool`` or
+            ``RuntimeError``).
+    """
+
+    def __init__(self, cause: Exception) -> None:
+        """Initialize wrapping the underlying cause.
+
+        Args:
+            cause: The exception the ranker adapter caught. Stored
+                verbatim so callers can inspect it.
+        """
+        super().__init__(f"relevance ranker error: {cause}")
+        self.cause = cause
+
+
 class PartialFailureThresholdExceededError(EnrichedQAError):
     """Raised when too many storage fetches fail during a single request.
 

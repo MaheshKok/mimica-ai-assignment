@@ -437,3 +437,22 @@ Live stack (real uvicorn + real pool):
 - No `max_tasks_per_child`. Worker recycling is production hardening; not worth the multiprocessing-lifecycle debugging cost on a short timeline.
 - No event-loop-lag measurement under CPU load. Documented as an observation exercise, not a gate.
 - No real ML (CLIP, embeddings, weights). The ranker is a deterministic hash — the point is the process-pool plumbing, not model fidelity.
+
+### Post-review fixes (Phase 6 → Phase 7 entry)
+
+Two adversarial reviewers (Codex + second LLM) raised five findings after the initial Phase 6 commit. Resolved:
+
+| Severity | Finding | Fix |
+|---|---|---|
+| HIGH | `BrokenProcessPool` (worker crashed) and `RuntimeError` (pool already shut down) leaked through `rank()` as generic 500s. One broken pool would brick every subsequent rank until process restart, and the existing `{error, detail, request_id}` envelope never fired. | Added `RelevanceRankerError(EnrichedQAError)` in `app/core/errors.py`. `CpuRelevanceRanker.rank` now catches `BrokenProcessPool` and `RuntimeError` and re-raises as `RelevanceRankerError` (preserving `__cause__`). `app/main.py` registers a handler returning HTTP 503 with `error="relevance_ranker_unavailable"`. Pool recreation is deliberately NOT attempted - concurrent-request coordination is out of scope and the correct production answer is a readiness probe + orchestrator restart (documented in the `RelevanceRankerError` docstring). |
+| MEDIUM | Lifespan shutdown used `wait=False, cancel_futures=True`. `cancel_futures` only cancels queued work; a running worker kept consuming CPU past teardown, contradicting the surrounding comment. | Switched to `shutdown(wait=True, cancel_futures=True)`: queued work is dropped, running work is drained. Safe because uvicorn's graceful shutdown drains active requests before lifespan teardown runs, and each rank is already bounded by the per-request `asyncio.timeout(REQUEST_TIMEOUT_MS)` budget. Comment rewritten to describe what actually happens. |
+| MEDIUM | Child-process assertion (`test_pool_worker_reports_child_process_name`) submitted the probe directly and only showed the pool *can* run work in a child - it did not prove `rank()` was the dispatch site. A ranker that ran inline would still pass. | Added `test_rank_dispatches_rank_sync_via_pool`: wraps `loop.run_in_executor` with `unittest.mock.patch.object(wraps=...)` and asserts exactly one call, that the first arg is the configured pool (identity check), and the second arg is `_rank_sync` (identity check). Combined with the existing non-`MainProcess` assertion, this bounds both "dispatched" and "ran in a child". |
+| MEDIUM | `test_live_stack.py` asserted the 200 response shape but would pass identically if the fake ranker were wired instead of `CpuRelevanceRanker`. | Added `test_wires_cpu_relevance_ranker_and_process_pool` in `test_main.py`: enters the real lifespan via `TestClient(app)`, asserts `app.state.ports.relevance` is a `CpuRelevanceRanker`, that its `pool` reference is the same instance on `app.state.process_pool`, and that `max_input` tracks `settings.max_rank_input`. Lifespan-level is cheaper and tighter than cross-process introspection in the subprocess test. |
+| MEDIUM | Pool shutdown behavior had no test: a regression that silently dropped `cancel_futures` or left the pool open would not fail. | Added `test_shuts_down_process_pool_on_exit`: after `TestClient(app)` exits, `pool.submit(...)` must raise `RuntimeError`. Proves the lifespan `finally` branch ran and that `wait=True` did not hang (test would time out). |
+| MEDIUM (P2) | README current-state block still said "Phase 5 complete" after the Phase 6 commit. Evaluator-visible drift. | Rewrote the block: Phase 6 complete, explicit mention of the `ProcessPoolExecutor` and the 503 `relevance_ranker_unavailable` path. Phase 7 named as the next step. |
+
+New tests: +10 (5 in `test_main.py`, 4 in `test_relevance_cpu.py`, 4 in `test_errors.py` offset by refactor).
+
+### Known ergonomic gap
+
+- None remaining after the post-review fixes above. The pool shutdown path is now explicit and tested.

@@ -141,6 +141,107 @@ class TestLifespan:
             assert not client.is_closed
         assert client.is_closed, "lifespan must close the shared http client on shutdown"
 
+    def test_wires_cpu_relevance_ranker_and_process_pool(self) -> None:
+        """Lifespan must wire the Phase 6 CPU ranker with the owned pool.
+
+        Without this assertion, a regression that reverted to
+        ``FakeRelevanceRanker`` (or never swapped it in) would pass the
+        live-stack 200 test - the fake produces the same response shape.
+        Asserts the ranker type, that the pool injected into the ranker
+        is the same instance stashed on ``app.state``, and that
+        ``max_input`` matches the configured ``max_rank_input``.
+        """
+        from concurrent.futures import ProcessPoolExecutor
+
+        from app.adapters.relevance_cpu import CpuRelevanceRanker
+        from app.main import app
+
+        with TestClient(app):
+            ranker = app.state.ports.relevance
+            assert isinstance(ranker, CpuRelevanceRanker), (
+                f"Phase 6 lifespan must wire CpuRelevanceRanker, got {type(ranker).__name__}"
+            )
+            assert isinstance(app.state.process_pool, ProcessPoolExecutor)
+            assert ranker.pool is app.state.process_pool, (
+                "ranker must reference the lifespan-owned pool, not a private one"
+            )
+            assert ranker.max_input == app.state.settings.max_rank_input
+
+    def test_shuts_down_process_pool_on_exit(self) -> None:
+        """Lifespan's finally branch must shut the pool down.
+
+        A submit-after-exit must raise - proves ``shutdown(wait=True)``
+        actually ran. Without this, a slow rank lingering past teardown
+        could keep workers and sockets alive across reloads.
+        """
+        from app.main import app
+
+        with TestClient(app):
+            pool = app.state.process_pool
+        with pytest.raises(RuntimeError):
+            pool.submit(pow, 2, 3)
+
+
+class TestRelevanceRankerErrorHandler:
+    """Route handler must map ``RelevanceRankerError`` to HTTP 503.
+
+    Covers the path a broken process pool takes through the adapter:
+    orchestrator propagates the exception, the handler returns a 503
+    envelope with error=``relevance_ranker_unavailable``, preserving
+    the request_id and the cause in ``detail``.
+    """
+
+    def test_relevance_ranker_error_returns_503_envelope(self) -> None:
+        from app.core.errors import RelevanceRankerError
+        from app.main import app
+
+        class _ExplodingRanker:
+            async def rank(self, screenshots: object, question: str, top_k: int) -> list[str]:
+                raise RelevanceRankerError(RuntimeError("pool is broken"))
+
+        def _override_ports() -> Ports:
+            return Ports(
+                workflow=_WorkflowThatStreamsOneRef(),
+                storage=FakeScreenshotStorage(
+                    images={"img-1.png": b"bytes"},
+                ),
+                relevance=_ExplodingRanker(),  # type: ignore[arg-type]
+            )
+
+        app.dependency_overrides[get_ports] = _override_ports
+        try:
+            with TestClient(app) as client:
+                r = client.post(
+                    "/enriched-qa",
+                    json={
+                        "project_id": str(uuid4()),
+                        "from": 1_700_000_000,
+                        "to": 1_700_001_000,
+                        "question": "what is happening?",
+                    },
+                )
+            assert r.status_code == 503, r.text
+            body = r.json()
+            assert body["error"] == "relevance_ranker_unavailable"
+            assert "pool is broken" in body["detail"]
+            assert UUID(body["request_id"])
+        finally:
+            app.dependency_overrides.clear()
+
+
+@dataclass
+class _WorkflowThatStreamsOneRef:
+    """Minimal workflow stub yielding one ref in the requested window."""
+
+    qa_calls: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
+
+    async def stream_project(self, project_id: UUID) -> AsyncIterator[ScreenshotRef]:
+        yield ScreenshotRef(timestamp=1_700_000_500, image_id="img-1.png")
+
+    async def qa_answer(self, question: str, relevant_images: list[str]) -> str:
+        self.qa_calls.append((question, tuple(relevant_images)))
+        return "ok"
+
 
 class TestRootFactory:
     def test_create_app_produces_fresh_instance_each_call(self) -> None:

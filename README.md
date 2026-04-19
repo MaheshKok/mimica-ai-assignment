@@ -3,12 +3,15 @@
 Async REST service that enriches a QA endpoint with relevant screenshots from a
 project time window.
 
-> **Current state: Phase 5 complete.** Separable mock services under
+> **Current state: Phase 6 complete.** Separable mock services under
 > `mock_services/` (workflow and storage), each runnable standalone via
 > `python -m mock_services.<name>`. Real `httpx`-backed adapters talk to
 > them across real sockets, through the production FastAPI lifespan and
-> `build_http_ports` wiring. The next step is Phase 6 — replacing the
-> fake relevance ranker with a CPU-bound `ProcessPoolExecutor` implementation.
+> `build_http_ports` wiring. The relevance ranker runs on a
+> lifespan-owned `ProcessPoolExecutor`, so CPU-bound work never blocks
+> the event loop; broken or shut-down pools surface as a controlled
+> HTTP 503 (`relevance_ranker_unavailable`). Phase 7 adds observability
+> (OTel spans, structured logs, request-id middleware).
 > Architecture lives in [architect.md](architect.md); phase-by-phase execution
 > in [plan.md](plan.md); per-phase decision log in [PHASE_NOTES.md](PHASE_NOTES.md).
 

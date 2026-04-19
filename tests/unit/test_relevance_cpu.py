@@ -18,8 +18,11 @@ the main process.
 
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
@@ -28,6 +31,7 @@ from app.adapters.relevance_cpu import (
     _current_process_name,
     _rank_sync,
 )
+from app.core.errors import RelevanceRankerError
 from app.core.models import ScreenshotRef, ScreenshotWithBytes
 
 if TYPE_CHECKING:
@@ -183,8 +187,6 @@ class TestPoolRunsInChildProcess:
     """
 
     async def test_pool_worker_reports_child_process_name(self, pool: ProcessPoolExecutor) -> None:
-        import asyncio
-
         loop = asyncio.get_running_loop()
         name = await loop.run_in_executor(pool, _current_process_name)
         assert name != "MainProcess", (
@@ -200,3 +202,91 @@ class TestPoolRunsInChildProcess:
         readback, not a hard-coded string.
         """
         assert _current_process_name() == "MainProcess"
+
+    async def test_rank_dispatches_rank_sync_via_pool(self, pool: ProcessPoolExecutor) -> None:
+        """Prove ``rank()`` hands ``_rank_sync`` to the pool, not inline.
+
+        The earlier ``test_pool_worker_reports_child_process_name`` only
+        shows the pool *can* run work in a child; it does not show that
+        ``rank()`` is the dispatch site. This spy on ``run_in_executor``
+        closes that gap: exactly one call, first arg is the pool, second
+        arg is ``_rank_sync`` by identity.
+        """
+        ranker = CpuRelevanceRanker(pool=pool, max_input=10)
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "run_in_executor", wraps=loop.run_in_executor) as spy:
+            await ranker.rank([_item("a"), _item("b")], "q", 2)
+        assert spy.call_count == 1
+        (dispatched_executor, dispatched_fn, *_), _ = spy.call_args
+        assert dispatched_executor is pool
+        assert dispatched_fn is _rank_sync
+
+
+# --------------------------------------------------------------------------- #
+# Broken-pool / shutdown recovery path                                        #
+# --------------------------------------------------------------------------- #
+
+
+class TestBrokenPoolHandling:
+    """``CpuRelevanceRanker.rank`` must translate pool failures.
+
+    Without translation, a ``BrokenProcessPool`` (worker crashed or
+    killed) or ``RuntimeError`` from a shut-down pool propagates as a
+    generic 500. The adapter wraps both in ``RelevanceRankerError`` so
+    the route's 503 handler can produce a controlled envelope, and so
+    the underlying cause is preserved via ``__cause__`` for logging.
+    """
+
+    async def test_broken_process_pool_becomes_relevance_error(self) -> None:
+        pool = ProcessPoolExecutor(max_workers=1)
+        try:
+            ranker = CpuRelevanceRanker(pool=pool, max_input=10)
+            loop = asyncio.get_running_loop()
+            broken = BrokenProcessPool("worker 42 died")
+            with (
+                patch.object(loop, "run_in_executor", side_effect=broken),
+                pytest.raises(RelevanceRankerError) as excinfo,
+            ):
+                await ranker.rank([_item("a")], "q", 1)
+            assert excinfo.value.cause is broken
+            assert excinfo.value.__cause__ is broken
+            assert "worker 42 died" in str(excinfo.value)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    async def test_shut_down_pool_runtimeerror_becomes_relevance_error(
+        self,
+    ) -> None:
+        """``run_in_executor`` raises ``RuntimeError`` when the pool has shut down.
+
+        Simulates a rank call that races with lifespan teardown: the
+        adapter must still translate to ``RelevanceRankerError`` so the
+        503 envelope path fires instead of a generic 500.
+        """
+        pool = ProcessPoolExecutor(max_workers=1)
+        try:
+            ranker = CpuRelevanceRanker(pool=pool, max_input=10)
+            loop = asyncio.get_running_loop()
+            runtime_err = RuntimeError("cannot schedule new futures after shutdown")
+            with (
+                patch.object(loop, "run_in_executor", side_effect=runtime_err),
+                pytest.raises(RelevanceRankerError) as excinfo,
+            ):
+                await ranker.rank([_item("a")], "q", 1)
+            assert excinfo.value.cause is runtime_err
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    async def test_early_empty_short_circuit_bypasses_pool(self, pool: ProcessPoolExecutor) -> None:
+        """Empty input must not touch the pool at all.
+
+        Matters because a broken pool plus an empty request should still
+        return [] cleanly, not a 503. Asserts the adapter does not
+        dispatch when there is nothing to rank.
+        """
+        ranker = CpuRelevanceRanker(pool=pool, max_input=10)
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "run_in_executor") as spy:
+            assert await ranker.rank([], "q", 5) == []
+            assert await ranker.rank([_item("a")], "q", 0) == []
+        assert spy.call_count == 0

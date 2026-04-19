@@ -17,8 +17,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import multiprocessing
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from app.core.errors import RelevanceRankerError
 
 if TYPE_CHECKING:
     from concurrent.futures import ProcessPoolExecutor
@@ -106,10 +109,25 @@ class CpuRelevanceRanker:
             At most ``top_k`` image ids, ordered most relevant first. The
             ordering is stable for any given ``(image_ids, question, top_k)``
             input because :func:`_rank_sync` is pure.
+
+        Raises:
+            RelevanceRankerError: When the underlying pool is broken (a
+                worker died mid-task) or already shut down. The route
+                handler maps this to HTTP 503. The exception preserves
+                the original cause for logging.
         """
         if top_k <= 0 or not screenshots:
             return []
         bounded = screenshots[: self.max_input]
         image_ids = [s.ref.image_id for s in bounded]
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self.pool, _rank_sync, image_ids, question, top_k)
+        try:
+            return await loop.run_in_executor(self.pool, _rank_sync, image_ids, question, top_k)
+        except BrokenProcessPool as exc:
+            raise RelevanceRankerError(exc) from exc
+        except RuntimeError as exc:
+            # Raised by `run_in_executor` when the pool has already
+            # shut down (e.g. a rank call racing with lifespan exit).
+            # We surface the failure; recreation is not this adapter's
+            # responsibility - see the RelevanceRankerError docstring.
+            raise RelevanceRankerError(exc) from exc

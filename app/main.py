@@ -32,6 +32,7 @@ from app.api.routes import router
 from app.config import Settings
 from app.core.errors import (
     PartialFailureThresholdExceededError,
+    RelevanceRankerError,
     WorkflowUpstreamError,
 )
 from app.deps import build_http_ports
@@ -116,9 +117,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     - ``ports``: the :class:`Ports` bundle composed from the HTTP
       adapters plus the pool-backed relevance ranker.
 
-    Cleanup closes the HTTP client and shuts the process pool down on
-    shutdown. ``cancel_futures=True`` drops any in-flight work so a
-    slow rank call cannot block server teardown.
+    Shutdown closes the HTTP client and then drains the process pool
+    with ``wait=True, cancel_futures=True``: queued-but-not-started
+    tasks are dropped, and we block until running workers finish. The
+    per-request ``asyncio.timeout(REQUEST_TIMEOUT_MS)`` bounds how long
+    any individual rank can occupy a worker, and uvicorn's graceful
+    shutdown already waits for active requests before calling this
+    teardown - so ``wait=True`` does not hold the server open
+    indefinitely.
     """
     settings = Settings()
     application.state.settings = settings
@@ -149,7 +155,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await http_client.aclose()
-        process_pool.shutdown(wait=False, cancel_futures=True)
+        process_pool.shutdown(wait=True, cancel_futures=True)
 
 
 def create_app() -> FastAPI:
@@ -193,6 +199,26 @@ def create_app() -> FastAPI:
         return _error_envelope(
             502,
             error="workflow_upstream_failure",
+            detail=str(exc),
+            request_id=_request_id(request),
+        )
+
+    @application.exception_handler(RelevanceRankerError)
+    async def _on_relevance_ranker_error(
+        request: Request, exc: RelevanceRankerError
+    ) -> JSONResponse:
+        """Map a broken or shut-down process pool to HTTP 503.
+
+        503 (service unavailable) is the closest semantic match - the
+        infrastructure for CPU-bound ranking has failed, and the
+        expected recovery is a process restart triggered by a readiness
+        probe, not caller-side mitigation. The detail string carries the
+        underlying ``BrokenProcessPool``/``RuntimeError`` message for
+        log correlation.
+        """
+        return _error_envelope(
+            503,
+            error="relevance_ranker_unavailable",
             detail=str(exc),
             request_id=_request_id(request),
         )

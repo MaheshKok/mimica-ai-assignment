@@ -12,6 +12,7 @@ import pytest
 from app.core.errors import (
     EnrichedQAError,
     PartialFailureThresholdExceededError,
+    RelevanceRankerError,
     StorageFetchError,
     WorkflowUpstreamError,
 )
@@ -60,6 +61,25 @@ class TestWorkflowUpstreamError:
     def test_message_contains_cause(self) -> None:
         err = WorkflowUpstreamError(RuntimeError("upstream-down"))
         assert "upstream-down" in str(err)
+
+
+class TestRelevanceRankerError:
+    def test_is_enriched_qa_error(self) -> None:
+        assert issubclass(RelevanceRankerError, EnrichedQAError)
+
+    def test_preserves_cause_object_identity(self) -> None:
+        cause = RuntimeError("pool shut down")
+        err = RelevanceRankerError(cause)
+        assert err.cause is cause
+
+    def test_message_contains_cause(self) -> None:
+        err = RelevanceRankerError(RuntimeError("broken-pool-x"))
+        assert "broken-pool-x" in str(err)
+
+    def test_catchable_as_exception(self) -> None:
+        with pytest.raises(Exception) as excinfo:  # noqa: PT011 (contract test: base Exception is the point)
+            raise RelevanceRankerError(RuntimeError("boom"))
+        assert isinstance(excinfo.value, RelevanceRankerError)
 
 
 class TestPartialFailureThresholdExceededError:
