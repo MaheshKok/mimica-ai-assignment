@@ -218,6 +218,55 @@ class TestOTelSpanAttribute:
 # --------------------------------------------------------------------------- #
 
 
+class TestScopeStatePreservation:
+    def test_preserves_existing_state_attributes(self) -> None:
+        """Middleware must add request_id without destroying prior State attributes.
+
+        Regression gate for the non-destructive state fix: the previous
+        implementation replaced scope["state"] unconditionally, discarding
+        any attributes a prior ASGI layer (e.g. OTel middleware) had set.
+        """
+        import asyncio
+
+        from starlette.datastructures import State
+
+        captured: dict[str, object] = {}
+
+        async def inner_app(scope: dict[str, object], receive: object, send: object) -> None:
+            state = scope.get("state")
+            if isinstance(state, State):
+                captured["prior_value"] = getattr(state, "prior_value", None)
+                captured["request_id"] = getattr(state, "request_id", None)
+
+        prior_state = State()
+        prior_state.prior_value = "must_survive"
+
+        middleware = RequestIdMiddleware(inner_app)  # type: ignore[arg-type]
+
+        async def _receive() -> dict[str, str]:
+            return {"type": "http.disconnect"}
+
+        async def _send(msg: object) -> None:
+            pass
+
+        asyncio.run(
+            middleware(  # type: ignore[arg-type]
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/",
+                    "query_string": b"",
+                    "headers": [],
+                    "state": prior_state,
+                },
+                _receive,
+                _send,
+            )
+        )
+        assert captured.get("prior_value") == "must_survive"
+        assert captured.get("request_id") is not None
+
+
 class TestNonHttpScopePassthrough:
     def test_lifespan_scope_passes_through(self) -> None:
         """A lifespan scope must reach the wrapped app untouched."""

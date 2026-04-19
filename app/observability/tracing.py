@@ -1,10 +1,16 @@
 """OpenTelemetry tracing setup and auto-instrumentation.
 
 Wires an SDK :class:`~opentelemetry.sdk.trace.TracerProvider` with a
-``BatchSpanProcessor`` feeding either the OTLP exporter (when
-``OTEL_EXPORTER_OTLP_ENDPOINT`` is set) or a console exporter (so a local
-``make run`` emits spans to stdout without extra infrastructure). The
-FastAPI and httpx auto-instrumentors are attached once per application;
+``BatchSpanProcessor``. The exporter is chosen in priority order:
+
+1. :class:`~opentelemetry.exporter.otlp.proto.grpc.trace_exporter.OTLPSpanExporter`
+   when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set.
+2. :class:`~opentelemetry.sdk.trace.export.ConsoleSpanExporter` when
+   ``TRACE_CONSOLE=true`` is set — an explicit dev opt-in.
+3. :class:`_NoOpExporter` otherwise — spans are silently discarded so
+   stdout remains a clean, machine-parseable JSON log stream.
+
+The FastAPI and httpx auto-instrumentors are attached once per application;
 manual spans in the orchestrator become children of the server span.
 
 Both :func:`configure` and :func:`instrument_app` are idempotent: the
@@ -26,6 +32,7 @@ from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
     ConsoleSpanExporter,
     SpanExporter,
+    SpanExportResult,
 )
 
 if TYPE_CHECKING:
@@ -128,12 +135,47 @@ def shutdown() -> None:
     _instrumented_apps = set()
 
 
+class _NoOpExporter(SpanExporter):
+    """Silently discard all spans when no exporter is configured.
+
+    Used as the production default when neither
+    ``OTEL_EXPORTER_OTLP_ENDPOINT`` nor ``TRACE_CONSOLE=true`` is set, so
+    stdout stays a clean machine-parseable JSON log stream instead of being
+    interleaved with multi-line span output.
+    """
+
+    def export(self, spans: object) -> SpanExportResult:
+        """Accept spans and discard them immediately.
+
+        Args:
+            spans: Finished spans from the SDK (unused).
+
+        Returns:
+            Always :data:`SpanExportResult.SUCCESS`.
+        """
+        return SpanExportResult.SUCCESS
+
+
 def _default_exporter(settings: Settings) -> SpanExporter:
-    """Pick an exporter based on ``settings.otel_exporter_otlp_endpoint``."""
-    endpoint = settings.otel_exporter_otlp_endpoint
-    if endpoint:
-        return OTLPSpanExporter(endpoint=endpoint)
-    return ConsoleSpanExporter()
+    """Pick an exporter based on settings.
+
+    Priority:
+
+    1. OTLP when ``settings.otel_exporter_otlp_endpoint`` is set.
+    2. Console when ``settings.trace_console`` is ``True`` (explicit dev opt-in).
+    3. :class:`_NoOpExporter` otherwise — spans discarded, stdout stays clean.
+
+    Args:
+        settings: Active :class:`~app.config.Settings`.
+
+    Returns:
+        A :class:`SpanExporter` instance appropriate for the environment.
+    """
+    if settings.otel_exporter_otlp_endpoint:
+        return OTLPSpanExporter(endpoint=settings.otel_exporter_otlp_endpoint)
+    if settings.trace_console:
+        return ConsoleSpanExporter()
+    return _NoOpExporter()
 
 
 def _current_sdk_provider_or_raise() -> TracerProvider:

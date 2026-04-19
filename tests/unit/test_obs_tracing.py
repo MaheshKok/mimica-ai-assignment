@@ -58,9 +58,18 @@ class TestConfigureInstallsSdkProvider:
 
 
 class TestConfigureExporterSelection:
-    def test_no_endpoint_falls_back_to_console_exporter(self) -> None:
-        """With ``otel_exporter_otlp_endpoint`` unset the default exporter is the console one."""
+    def test_no_endpoint_no_console_flag_returns_no_op_exporter(self) -> None:
+        """Default config (no OTLP, no trace_console) must not pollute stdout with spans."""
         settings = Settings(_env_file=None)  # type: ignore[arg-type]
+        exporter = tracing_mod._default_exporter(settings)
+        assert isinstance(exporter, tracing_mod._NoOpExporter)
+
+    def test_trace_console_flag_returns_console_exporter(self) -> None:
+        """Explicit ``trace_console=True`` opts in to stdout span output."""
+        settings = Settings(
+            _env_file=None,  # type: ignore[arg-type]
+            trace_console=True,
+        )
         exporter = tracing_mod._default_exporter(settings)
         from opentelemetry.sdk.trace.export import ConsoleSpanExporter
 
@@ -70,6 +79,18 @@ class TestConfigureExporterSelection:
         settings = Settings(
             _env_file=None,  # type: ignore[arg-type]
             otel_exporter_otlp_endpoint="http://collector.example:4317",
+        )
+        exporter = tracing_mod._default_exporter(settings)
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+        assert isinstance(exporter, OTLPSpanExporter)
+
+    def test_otlp_takes_priority_over_trace_console(self) -> None:
+        """OTLP endpoint beats the console flag so no duplicate span output."""
+        settings = Settings(
+            _env_file=None,  # type: ignore[arg-type]
+            otel_exporter_otlp_endpoint="http://collector.example:4317",
+            trace_console=True,
         )
         exporter = tracing_mod._default_exporter(settings)
         from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter

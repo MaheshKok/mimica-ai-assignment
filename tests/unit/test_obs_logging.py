@@ -18,8 +18,12 @@ import io
 import json
 import logging
 from contextlib import redirect_stdout
+from typing import TYPE_CHECKING
 
 import structlog
+
+if TYPE_CHECKING:
+    import pytest
 
 from app.observability.logging import configure
 
@@ -88,3 +92,30 @@ class TestStdlibLoggingRouted:
             assert logging.getLogger().level == logging.WARNING
         finally:
             configure()  # restore INFO default
+
+    def test_stdlib_warning_emits_json_with_request_id(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Stdlib log records must be JSON-formatted and include bound contextvars.
+
+        This is the regression gate for the ProcessorFormatter fix: if stdlib
+        logging is only wired via ``basicConfig(format="%(message)s")`` the
+        record is plain text and request_id is absent.
+
+        The stdlib StreamHandler stores a reference to sys.stdout at configure()
+        time, which inside a pytest test is pytest's own capture buffer.
+        ``capsys.readouterr()`` reads from that buffer, so it correctly
+        intercepts what the StreamHandler wrote (unlike ``redirect_stdout``
+        which changes the name ``sys.stdout`` but not the stored reference).
+        """
+        configure()
+        structlog.contextvars.clear_contextvars()
+        with structlog.contextvars.bound_contextvars(request_id="rid-stdlib-001"):
+            logging.getLogger("test.adapter").warning("malformed ndjson line")
+        captured = capsys.readouterr()
+        line = captured.out.strip()
+        assert line, "stdlib log must produce JSON output on stdout"
+        parsed = json.loads(line)
+        assert parsed.get("request_id") == "rid-stdlib-001"
+        assert parsed.get("level") in {"warning", "warn"}
+        assert "event" in parsed or "message" in parsed

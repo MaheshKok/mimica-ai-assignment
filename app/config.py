@@ -34,7 +34,11 @@ class Settings(BaseSettings):
             streaming once it sees ``timestamp >= to``.
         request_timeout_ms: Total per-request budget before 504.
         otel_exporter_otlp_endpoint: OTLP collector endpoint. ``None``
-            means use the console exporter.
+            means fall through to ``trace_console``.
+        trace_console: When ``True``, emit spans to stdout via
+            :class:`~opentelemetry.sdk.trace.export.ConsoleSpanExporter`.
+            Requires no collector and is the explicit dev opt-in. Has no
+            effect when ``otel_exporter_otlp_endpoint`` is set.
     """
 
     model_config = SettingsConfigDict(
@@ -65,3 +69,4 @@ class Settings(BaseSettings):
     request_timeout_ms: PositiveInt = Field(default=15000)
 
     otel_exporter_otlp_endpoint: str | None = Field(default=None)
+    trace_console: bool = Field(default=False)
