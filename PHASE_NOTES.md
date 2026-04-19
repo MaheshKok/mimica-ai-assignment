@@ -331,7 +331,7 @@ Complete. **Gate passed.** `make run-mocks` + `make run` + `curl` returns **HTTP
 
 ### Tests
 
-**+17 tests** (254 total). Split across three layers:
+**+20 tests** (257 total). Split across three layers:
 
 - `tests/unit/test_storage_mock.py` (5 tests): per-route mock behaviour via `httpx.ASGITransport`, including `{image_id:path}` decoding of `%2F`, `%3F`, and unicode.
 - `tests/unit/test_workflow_mock.py` (5 tests): NDJSON row shape, `?shuffle=true` determinism per-project, `create_app(refs=...)` factory, QA-echo order preservation, `422` on empty question.
@@ -345,7 +345,7 @@ Complete. **Gate passed.** `make run-mocks` + `make run` + `curl` returns **HTTP
 ### Verification
 
 ```
-make test            254 passed in 1.74s   (+17 vs Phase 4)
+make test            257 passed
 make test-cov        100% coverage (gate 93%)
 make lint            ruff + flake8 clean
 make typecheck       mypy strict clean (29 source files)
@@ -363,9 +363,21 @@ Live stack (real uvicorn):
 
 ### Deviations from plan.md
 
-- Integration tests use `httpx.ASGITransport` instead of launching uvicorn sub-processes. Runs in the same event loop as the test, zero socket overhead, ~5× faster. Still exercises every httpx encoding/header/streaming code path the real wire would. The real-uvicorn path is verified separately via the live smoke above.
+- Integration tests are split into two layers (see "Post-review fixes" below). Component-level encoding/partial-failure coverage stays on `httpx.ASGITransport` (fast); the Phase 5 production-wiring gate is a separate subprocess-backed test.
 - Pre-commit mypy env extended with `uvicorn[standard]` so the `__main__` modules type-check under the hook.
+
+### Post-review fixes (Phase 5 → Phase 6 entry)
+
+Two adversarial reviewers (Codex + second LLM) raised three findings after the initial Phase 5 commit. Resolved:
+
+| Severity | Finding | Fix |
+|---|---|---|
+| HIGH | Integration suite bypassed the separable-service boundary it claimed to validate: every test used in-process `ASGITransport` with `dependency_overrides`, so no test ever hit a TCP socket, ran the production lifespan, or exercised `build_http_ports` / default `WORKFLOW_API_URL` resolution. A misconfigured default or broken `__main__` would have passed CI silently. | New `tests/integration/test_live_stack.py`: spawns the workflow mock, storage mock, and the real app as three `uvicorn` subprocesses on ephemeral ports (one test per run, ~1s on a warm cache). Uses a TCP readiness probe that watches both the port AND the child pid, so a crashed mock fails the test fast instead of waiting the full timeout. Points the app at the mocks via `WORKFLOW_API_URL` / `STORAGE_BASE_URL` env vars — the exact knobs evaluators use — so a broken default would fail here. Existing ASGITransport tests keep their role as fast component tests for encoding and partial-failure paths. |
+| MEDIUM (P2) | README still described Phase 4 state: "current state is Phase 4", "Phase 5 is next", "POST /enriched-qa returns 502" as the expected success signal. Actively misleading for anyone reading README first. | Rewrote the current-state block and Running section to describe Phase 5: `make run-mocks` + `make run` + working `curl` example returning 200 with the full response envelope. Moved the 502 shape into a troubleshooting note for "mocks not running" with the same framing (confirms upstream adapters and `request_id` correlation are wired, only the mock service is absent). |
+| MEDIUM (P3) | `make run-mocks` used `trap 'kill %1 %2' INT TERM; wait` — job-spec cleanup is brittle across shells, doesn't handle either mock exiting unexpectedly, has no readiness probe, and exited non-zero on Ctrl-C in one reviewer's smoke. A partial-start failure (port in use, import crash) left the other mock orphaned with the recipe still waiting. | Extracted to `scripts/run_mocks.sh` (clean, testable bash 3.2-compatible). PID tracking on both uv processes, `/dev/tcp` readiness probe with early-exit on `ps`-state zombie detection (macOS bash 3.2 has no `wait -n`, and `kill -0` doesn't distinguish zombies from live processes), flag-based SIGINT handler yielding rc=0, fail-fast loop that kills the sibling and exits rc=1 when either child dies unexpectedly. Ports and timeout are env-configurable so the same script serves local use and CI. `mock_services/*/__main__.py` updated to honour `WORKFLOW_PORT` / `STORAGE_PORT` env vars so the override reaches the uvicorn bind site. Covered by subprocess integration tests for ready+SIGINT cleanup and occupied-port preflight. |
+| MEDIUM (P3) | Readiness could attach to a foreign process because `/dev/tcp` only proves a listener exists on the port, not that the intended child owns it. | Added pre-spawn port availability checks for both mock ports. If either port is already occupied, the script exits rc=1 with a clear `ERROR: <name> port ... is already in use` message and never prints `Both mocks ready`. |
+| MEDIUM (P3) | The live TCP test still bypassed the evaluator-facing mock launchers by starting uvicorn directly. | Added subprocess integration coverage for `scripts/run_mocks.sh`, which exercises `python -m mock_services.workflow_api`, `python -m mock_services.storage_api`, `WORKFLOW_PORT` / `STORAGE_PORT`, readiness, SIGINT rc=0, and cleanup. |
 
 ### Known ergonomic gap
 
-- `make run-mocks` uses `trap ... ; wait` which requires bash-compatible shell semantics. On a system shell lacking job-control syntax the cleanup path won't fire. Not blocking — `make run-mocks` works on macOS/Linux zsh and bash.
+- None remaining after the post-review fixes above. The `scripts/run_mocks.sh` path was smoke-verified on macOS bash 3.2.

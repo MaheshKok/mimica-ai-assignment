@@ -14,12 +14,8 @@ sync:  ## Resolve and install dependencies via uv.
 run:  ## Run the FastAPI service (Phase 3+).
 	uv run uvicorn app.main:app --reload --port 8000
 
-run-mocks:  ## Run both mock services: workflow :9000 and storage :9100.
-	@echo "Starting mocks — workflow :9000, storage :9100 (Ctrl-C stops both)"
-	@trap 'kill %1 %2 2>/dev/null; exit 0' INT TERM; \
-		uv run python -m mock_services.workflow_api & \
-		uv run python -m mock_services.storage_api & \
-		wait
+run-mocks:  ## Run both mock services with PID tracking, readiness probes, and fail-fast cleanup.
+	@bash scripts/run_mocks.sh
 
 test:  ## Run the test suite (without coverage gate).
 	uv run pytest

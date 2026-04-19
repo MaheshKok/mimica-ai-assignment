@@ -1,39 +1,82 @@
 # Enriched QA Service
 
-Async REST service that enriches a QA endpoint with relevant screenshots from a project time window.
+Async REST service that enriches a QA endpoint with relevant screenshots from a
+project time window.
 
-> **Current state: Phase 4 complete.** Real `httpx`-backed adapters for the Workflow Services API
-> and S3-compatible storage are wired behind the `Ports` abstraction, with pre-fetch sampling,
-> per-request + process-wide back-pressure, and a per-request timeout budget.
-> Phase 5 (separable mock services under `mock_services/`) is next.
-> Architecture lives in [architect.md](architect.md); phase-by-phase execution in
-> [plan.md](plan.md); per-phase decision log in [PHASE_NOTES.md](PHASE_NOTES.md).
+> **Current state: Phase 5 complete.** Separable mock services under
+> `mock_services/` (workflow and storage), each runnable standalone via
+> `python -m mock_services.<name>`. Real `httpx`-backed adapters talk to
+> them across real sockets, through the production FastAPI lifespan and
+> `build_http_ports` wiring. The next step is Phase 6 — replacing the
+> fake relevance ranker with a CPU-bound `ProcessPoolExecutor` implementation.
+> Architecture lives in [architect.md](architect.md); phase-by-phase execution
+> in [plan.md](plan.md); per-phase decision log in [PHASE_NOTES.md](PHASE_NOTES.md).
 
 ## Quickstart (evaluators)
 
 ```bash
 make install   # uv sync - installs all dependencies
-make test      # run pytest
+make test      # run pytest (all suites)
 make test-cov  # run pytest with 93% coverage gate
 make lint      # ruff + flake8
 make typecheck # mypy strict
 ```
 
-Python 3.12 required. Dependencies are managed with [`uv`](https://docs.astral.sh/uv/).
-`make install` does **not** install git hooks, so it works from a zipped submission
-without a `.git` directory.
+Python 3.12 required. Dependencies are managed with
+[`uv`](https://docs.astral.sh/uv/). `make install` does **not** install git
+hooks, so it works from a zipped submission without a `.git` directory.
 
-## Running the service
+## Running the live stack
+
+Two terminals:
 
 ```bash
-make run       # starts uvicorn on :8000 with the real HTTP adapters wired
+# terminal 1 — starts both mocks with PID tracking, readiness probes,
+# and fail-fast cleanup. Ctrl-C stops both.
+make run-mocks    # workflow :9000, storage :9100
+
+# terminal 2 — starts the real service
+make run          # :8000
 ```
 
-**Expected behaviour today (end of Phase 4):** the service starts, but any
-`POST /enriched-qa` will return `502 workflow_upstream_failure` because the
-adapters try to reach `http://localhost:9000` (Workflow) and
-`http://localhost:9100` (Storage), which are not yet running — Phase 5
-brings the separable mock services online. A real 502 response looks like:
+Then POST to `/enriched-qa`:
+
+```bash
+curl -s -X POST http://localhost:8000/enriched-qa \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "project_id":"00000000-0000-0000-0000-000000000001",
+        "from":1700000000,
+        "to":1700001000,
+        "question":"what is happening?"
+      }' | jq .
+```
+
+Expected `200 OK` response:
+
+```json
+{
+  "answer": "Q: what is happening? | IDs: img-005.png,img-006.png,...",
+  "meta": {
+    "request_id": "<uuid>",
+    "images_considered": 10,
+    "images_relevant": 10,
+    "errors": {},
+    "latency_ms": {"stream": 21, "fetch": 14, "rank": 0, "qa": 1, "total": 37}
+  }
+}
+```
+
+The target URLs are configurable via `WORKFLOW_API_URL` and `STORAGE_BASE_URL`
+— see `.env.example` — so you can point the service at any compatible
+deployment. The mock ports can be overridden via `WORKFLOW_PORT` /
+`STORAGE_PORT` env vars before `make run-mocks`.
+
+### Troubleshooting: mocks not running
+
+If you hit `make run` without `make run-mocks` first, the HTTP adapters cannot
+reach the upstream and every request returns a **502 `workflow_upstream_failure`**
+envelope:
 
 ```json
 {
@@ -43,26 +86,31 @@ brings the separable mock services online. A real 502 response looks like:
 }
 ```
 
-This is the expected shape of the error envelope (architect.md §7) and proves
-the HTTP adapters, the route timeout, and the `request_id` stashing are all
-wired correctly end-to-end. Phase 5 will flip this to `200 OK`.
-
-The target URLs are configurable via environment variables — see `.env.example`
-(`WORKFLOW_API_URL`, `STORAGE_BASE_URL`) — so you can point at any compatible
-service.
+Seeing this shape means the route timeout, `request_id` correlation, and error
+envelope are all wired correctly — only the upstream is absent. Start
+`make run-mocks` in a second terminal and retry.
 
 ## Testing
 
 ```bash
-make test                             # fast — full suite on fakes and MockTransport, no network
-make test-cov                         # same, with the 93% branch-coverage gate enforced
+make test       # full suite; ASGITransport integration + one live-socket test
+make test-cov   # same, with the 93% branch-coverage gate enforced
 
-uv run pytest tests/unit/test_orchestrator.py -v     # core pipeline
-uv run pytest tests/unit/test_workflow_http.py -v    # HTTP adapter (via httpx.MockTransport)
-uv run pytest tests/unit/test_storage_http.py -v     # HTTP adapter (via httpx.MockTransport)
-uv run pytest tests/unit/test_routes.py -v           # FastAPI wire-up via dependency_overrides
-uv run pytest tests/unit/test_boundary_contracts.py  # timeout, request-id, input sanitisation
+uv run pytest tests/unit/test_orchestrator.py -v         # core pipeline
+uv run pytest tests/unit/test_workflow_http.py -v        # HTTP adapter (httpx.MockTransport)
+uv run pytest tests/unit/test_storage_http.py -v         # HTTP adapter (httpx.MockTransport)
+uv run pytest tests/unit/test_routes.py -v               # FastAPI wire-up via overrides
+uv run pytest tests/unit/test_boundary_contracts.py      # timeout, request-id, sanitisation
+uv run pytest tests/integration/test_end_to_end.py       # component-level, ASGITransport
+uv run pytest tests/integration/test_live_stack.py       # real sockets + subprocess mocks
 ```
+
+The integration suite is split into two layers. `test_end_to_end.py` uses
+`httpx.ASGITransport` for fast component-level coverage of encoding,
+partial-failure handling, and order preservation. `test_live_stack.py` spawns
+the mocks and the app as real `uvicorn` subprocesses on ephemeral ports and
+exercises the full production wiring — shared `httpx.AsyncClient` lifespan,
+`build_http_ports`, and TCP between every hop.
 
 ## Contributors
 
