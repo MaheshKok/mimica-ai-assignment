@@ -56,8 +56,8 @@ def configure(settings: Settings, *, exporter: SpanExporter | None = None) -> Tr
     1. The explicit ``exporter`` argument (tests inject an in-memory one).
     2. :class:`OTLPSpanExporter` when ``settings.otel_exporter_otlp_endpoint``
        is set.
-    3. :class:`ConsoleSpanExporter` - spans stream to stdout, which is
-       what the Phase 7 gate checks.
+    3. :class:`ConsoleSpanExporter` when ``settings.trace_console`` is true.
+    4. :class:`_NoOpExporter` otherwise, keeping stdout JSON-log-only.
 
     Subsequent calls are no-ops (apart from returning the existing
     provider) so that test-reloads and repeated ``create_app`` runs do

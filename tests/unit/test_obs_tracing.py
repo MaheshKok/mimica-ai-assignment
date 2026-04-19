@@ -5,8 +5,9 @@ Contract (derived from the module docstring + OTel API):
 - ``configure(settings)`` installs a real SDK :class:`TracerProvider`
   replacing OTel's default ``ProxyTracerProvider``.
 - Picking the exporter respects ``settings.otel_exporter_otlp_endpoint``
-  (unset -> console; set -> OTLP). Tests use an in-memory override to
-  capture spans without touching the network.
+  and ``settings.trace_console``: OTLP when set, console only when
+  explicitly requested, no-op otherwise. Tests use an in-memory override
+  to capture spans without touching the network.
 - ``configure`` is idempotent: a second call returns the same provider
   and does not stack additional processors.
 - ``shutdown`` flushes and resets, so the next ``configure`` installs

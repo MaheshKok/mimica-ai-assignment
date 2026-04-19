@@ -10,9 +10,10 @@ project time window.
 > (`enriched_qa.handler`, `workflow.stream`, `storage.fetch_batch`,
 > `relevance.rank`, `workflow.qa_answer`) nested under the auto-instrumented
 > FastAPI server span, with `httpx` client spans auto-attached for every
-> upstream call. Spans export to `OTEL_EXPORTER_OTLP_ENDPOINT` when set and fall
-> back to a console exporter for local runs. Logs are JSON-rendered with
-> timestamp, level, event, and bound `request_id`. The relevance ranker still
+> upstream call. Spans export to `OTEL_EXPORTER_OTLP_ENDPOINT` when set, or to
+> stdout only when `TRACE_CONSOLE=true`; otherwise spans are discarded so stdout
+> stays JSON-log-only. Logs are JSON-rendered with timestamp, level, event, and
+> bound `request_id`. The relevance ranker still
 > runs on a lifespan-owned `ProcessPoolExecutor` from Phase 6; broken or
 > shut-down pools surface as HTTP 503 (`relevance_ranker_unavailable`).
 > Architecture lives in [architect.md](architect.md); phase-by-phase execution
@@ -123,9 +124,10 @@ inbound `X-Request-Id`, proving the observability pipeline is fully wired.
 ## Observability
 
 Set `OTEL_EXPORTER_OTLP_ENDPOINT=https://your-collector:4317` to ship spans
-over OTLP/gRPC. Leave it unset and spans stream to stdout via the console
-exporter — useful for `make run` without standing up infrastructure. The
-service name on every resource is `enriched-qa-service`.
+over OTLP/gRPC. For local span debugging without a collector, set
+`TRACE_CONSOLE=true` and spans stream to stdout via the console exporter. With
+both unset/false, spans use a no-op exporter so stdout stays a clean JSON log
+stream. The service name on every resource is `enriched-qa-service`.
 
 - **Request correlation**: the service honours an inbound `X-Request-Id`
   header (empty and whitespace-only values are ignored), otherwise mints a

@@ -451,29 +451,32 @@ None. The pool shutdown path, broken-pool 503 path, and dispatch proof are all t
 ### Status
 
 Complete. Gate satisfied: a real `POST /enriched-qa` through `uvicorn` prints
-a structured JSON log line carrying the caller-supplied `X-Request-Id`, and the
-orchestrator emits the five manual spans (`enriched_qa.handler`,
+a structured JSON log line carrying the caller-supplied `X-Request-Id`. The
+orchestrator creates the five manual spans (`enriched_qa.handler`,
 `workflow.stream`, `storage.fetch_batch`, `relevance.rank`, `workflow.qa_answer`)
-on top of the auto-instrumented server/client spans.
+on top of the auto-instrumented server/client spans; those spans export to OTLP
+when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, to stdout only when
+`TRACE_CONSOLE=true`, and to a no-op exporter otherwise so stdout remains a
+JSON-log-only stream by default.
 
 ### What shipped
 
 | Component | Purpose |
 |---|---|
-| `app/observability/logging.py` | `configure(level=INFO)` — installs a structlog pipeline: `merge_contextvars`, `add_log_level`, `TimeStamper(iso, utc)`, `StackInfoRenderer`, `format_exc_info`, `JSONRenderer`. Also sets stdlib `logging.basicConfig(force=True)` so uvicorn's access log lands on the same stdout at the configured level. Idempotent — a second call does not stack processors. |
-| `app/observability/tracing.py` | `configure(settings, *, exporter=None)` — installs a global SDK `TracerProvider` with resource `service.name="enriched-qa-service"` and a single `BatchSpanProcessor`. Exporter priority: explicit arg > OTLP (when `OTEL_EXPORTER_OTLP_ENDPOINT` set) > `ConsoleSpanExporter`. `instrument_app(app)` attaches `FastAPIInstrumentor` per-app and `HTTPXClientInstrumentor` once globally. `shutdown()` flushes the provider AND resets OTel's private `_TRACER_PROVIDER_SET_ONCE` sentinel so a second `configure` in the same process (tests, uvicorn reload workers) installs a fresh provider instead of silently keeping the old one. |
-| `app/observability/middleware.py` | `RequestIdMiddleware` — pure ASGI middleware (not `BaseHTTPMiddleware`, which runs dispatch in a child task and drops contextvars in newer Starlette). On each HTTP scope: read inbound `X-Request-Id` or mint UUID4, stamp `scope["state"].request_id`, bind structlog contextvar, set `request_id` attribute on the current OTel span, wrap `send` to append `X-Request-Id` to the response headers, and reset the contextvar in `finally`. Non-HTTP scopes pass through untouched. |
-| `app/core/orchestrator.py` | Wraps `run` in `enriched_qa.handler` span with `project_id`, `time_window.{from,to}`, `question.length`, `images_considered`, `images_relevant`, `fetches.failed`. Nests `workflow.stream` (attr `refs.in_window`), `storage.fetch_batch` (`refs.requested`, `max_concurrent`, `fetches.succeeded`, `fetches.failed`), `relevance.rank` (`rank.input_size`, `rank.top_k`, `rank.output_size`), `workflow.qa_answer` (`qa.relevant_count`, `qa.answer_length`). Emits `enriched_qa.start`, `enriched_qa.empty_window`, `enriched_qa.done` structured log events. |
+| `app/observability/logging.py` | `configure(level=INFO)` — installs a structlog pipeline: `merge_contextvars`, `add_log_level`, `TimeStamper(iso, utc)`, `StackInfoRenderer`, `format_exc_info`, `JSONRenderer`. Stdlib records from uvicorn, httpx, and adapter loggers route through `structlog.stdlib.ProcessorFormatter`, so they emit the same JSON shape and receive bound contextvars such as `request_id`. Idempotent — a second call does not stack processors. |
+| `app/observability/tracing.py` | `configure(settings, *, exporter=None)` — installs a global SDK `TracerProvider` with resource `service.name="enriched-qa-service"` and a single `BatchSpanProcessor`. Exporter priority: explicit arg > OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set > `ConsoleSpanExporter` when `TRACE_CONSOLE=true` > `_NoOpExporter` otherwise. `instrument_app(app)` attaches `FastAPIInstrumentor` per-app and `HTTPXClientInstrumentor` once globally. `shutdown()` flushes the provider AND resets OTel's private `_TRACER_PROVIDER_SET_ONCE` sentinel so a second `configure` in the same process (tests, uvicorn reload workers) installs a fresh provider instead of silently keeping the old one. |
+| `app/observability/middleware.py` | `RequestIdMiddleware` — pure ASGI middleware (not `BaseHTTPMiddleware`, which runs dispatch in a child task and drops contextvars in newer Starlette). On each HTTP scope: read inbound `X-Request-Id` or mint UUID4, stamp the existing `scope["state"]` non-destructively (`dict` state stays a dict; existing `State` attributes survive), bind structlog contextvar, set `request_id` attribute on the current OTel span, wrap `send` to append `X-Request-Id` to the response headers, and reset the contextvar in `finally`. Non-HTTP scopes pass through untouched. |
+| `app/core/orchestrator.py` | Wraps `run` in `enriched_qa.handler` span with `project_id`, `time_window.{from,to}`, `question.length`, `images_considered`, `images_relevant`, `fetches.failed`. Handler-level counters are initialized before work starts and updated eagerly before failure-prone thresholds/QA calls, so non-success request spans still carry dashboard attributes. Nests `workflow.stream` (attr `refs.in_window`), `storage.fetch_batch` (`refs.requested`, `max_concurrent`, `fetches.succeeded`, `fetches.failed`), `relevance.rank` (`rank.input_size`, `rank.top_k`, `rank.output_size`), `workflow.qa_answer` (`qa.relevant_count`, `qa.answer_length`). Emits `enriched_qa.start`, `enriched_qa.empty_window`, `enriched_qa.done`, and `enriched_qa.failed` structured log events. |
 | `app/api/routes.py` | No longer mints its own `request_id`. Reads `request.state.request_id` set by the middleware and passes it to `run`. The middleware is the single source of truth — error-envelope id, meta id, and log id are all the same value by construction. |
 | `app/main.py` lifespan | Calls `obs_logging.configure()` then `obs_tracing.configure(settings)` before wiring ports, `obs_tracing.instrument_app(application)` in `create_app` after `include_router`, and `obs_tracing.shutdown()` in the `finally` branch (after pool + client shutdown). |
 
 ### Tests
 
-**+31 tests** (319 total, +1 integration). New files:
+**+36 tests** (324 total, +1 integration). New files:
 
-- `tests/unit/test_obs_logging.py` (7 cases): one JSON object per call, `level` + `timestamp` + bound contextvars appear in every line, kwargs flow through, calling `configure` twice still produces one line per log, stdlib root logger level tracks the structlog level.
-- `tests/unit/test_obs_tracing.py` (8 cases): `configure` installs an SDK `TracerProvider`; idempotent `configure` returns the same provider; exporter selection picks `Console` without an endpoint and `OTLP` with one; a manual span flows through the injected in-memory exporter; `shutdown` + re-`configure` installs a fresh provider so a post-reconfigure span reaches the *new* exporter only; `shutdown` without a prior `configure` is a no-op; `instrument_app` is idempotent per FastAPI instance.
-- `tests/unit/test_obs_middleware.py` (9 cases): inbound `X-Request-Id` propagates to `state` and response header; missing or empty or whitespace-only header mints a fresh UUID4; two requests get distinct ids; the bound contextvar is visible during the handler; the contextvar is cleared after the request (no leak across requests); the id is set as an attribute on the active OTel span (checked via an outer manual span); non-HTTP scopes (lifespan) pass through untouched with no `state` mutation.
+- `tests/unit/test_obs_logging.py` (8 cases): one JSON object per call, `level` + `timestamp` + bound contextvars appear in every line, kwargs flow through, calling `configure` twice still produces one line per log, stdlib root logger level tracks the structlog level, and stdlib warnings emit JSON with bound `request_id`.
+- `tests/unit/test_obs_tracing.py` (10 cases): `configure` installs an SDK `TracerProvider`; idempotent `configure` returns the same provider; exporter selection picks no-op when OTLP/console are both unset, `ConsoleSpanExporter` only with `trace_console=True`, OTLP when an endpoint is configured, and OTLP over console when both are set; a manual span flows through the injected in-memory exporter; `shutdown` + re-`configure` installs a fresh provider so a post-reconfigure span reaches the *new* exporter only; `shutdown` without a prior `configure` is a no-op; `instrument_app` is idempotent per FastAPI instance.
+- `tests/unit/test_obs_middleware.py` (11 cases): inbound `X-Request-Id` propagates to `state` and response header; missing or empty or whitespace-only header mints a fresh UUID4; two requests get distinct ids; the bound contextvar is visible during the handler; the contextvar is cleared after the request (no leak across requests); the id is set as an attribute on the active OTel span (checked via an outer manual span); existing ASGI dict state stays a dict and retains prior keys; existing `State` attributes survive; non-HTTP scopes (lifespan) pass through untouched with no `state` mutation.
 - `tests/unit/test_orchestrator_spans.py` (4 cases): all five expected span names are emitted for a successful request; `enriched_qa.handler` records `images_considered` + `images_relevant` attributes; every span in the run shares one trace id; the empty-window short-circuit emits only `enriched_qa.handler` and `workflow.stream` — fetch/rank/qa are genuinely skipped.
 - `tests/unit/test_main.py` (+2 cases): lifespan leaves `tracing_mod._configured = True` and resets it on exit; every response carries an `X-Request-Id` header, proving the middleware is installed on the app.
 - `tests/unit/test_boundary_contracts.py` (updated): the route-level request-id pinning test now uses an inbound `X-Request-Id` header instead of monkeypatching `routes.uuid4` (the route no longer mints).
@@ -482,8 +485,8 @@ on top of the auto-instrumented server/client spans.
 ### Verification
 
 ```
-make test            319 passed in 3.82s   (+31 vs Phase 6)
-make test-cov        99.43% total (gate 93%, strict)
+make test            324 passed
+make test-cov        99.59% total (gate 93%, strict)
 make lint            ruff + flake8 clean
 make typecheck       mypy strict clean (33 source files)
 pre-commit run --all-files   all 11 hooks pass

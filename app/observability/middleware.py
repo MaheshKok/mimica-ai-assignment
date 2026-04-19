@@ -73,17 +73,16 @@ class RequestIdMiddleware:
         request_id = _extract_or_mint_request_id(scope)
 
         # 1) state.request_id for error handlers + the route body.
-        # Starlette's Request.state requires attribute access on scope["state"].
-        # Preserve any state already set by a prior ASGI layer (e.g. an OTel
-        # middleware); copy dict-style state into a new State so no key is lost.
+        # ASGI scope state is conventionally a dict; Starlette wraps that dict
+        # in Request.state later. Preserve the existing shape so other ASGI
+        # layers can still use dict-style state after this middleware runs.
         existing = scope.get("state")
-        if not isinstance(existing, State):
-            new_state = State()
-            if isinstance(existing, dict):
-                for k, v in existing.items():
-                    setattr(new_state, k, v)
-            scope["state"] = new_state
-        scope["state"].request_id = request_id
+        if isinstance(existing, dict):
+            existing["request_id"] = request_id
+        elif isinstance(existing, State):
+            existing.request_id = request_id
+        else:
+            scope["state"] = {"request_id": request_id}
 
         # 2) structlog contextvar for every log line emitted below.
         # 3) OTel span attribute for searchability.

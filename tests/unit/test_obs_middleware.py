@@ -219,6 +219,42 @@ class TestOTelSpanAttribute:
 
 
 class TestScopeStatePreservation:
+    def test_preserves_existing_state_dict_shape(self) -> None:
+        """Middleware must add request_id without replacing ASGI dict state."""
+        import asyncio
+
+        captured: dict[str, object] = {}
+
+        async def inner_app(scope: dict[str, object], receive: object, send: object) -> None:
+            state = scope.get("state")
+            captured["is_dict"] = isinstance(state, dict)
+            if isinstance(state, dict):
+                captured["prior_value"] = state.get("prior_value")
+                captured["request_id"] = state.get("request_id")
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "query_string": b"",
+            "headers": [],
+            "state": {"prior_value": "must_survive"},
+        }
+        middleware = RequestIdMiddleware(inner_app)  # type: ignore[arg-type]
+
+        async def _receive() -> dict[str, str]:
+            return {"type": "http.disconnect"}
+
+        async def _send(msg: object) -> None:
+            pass
+
+        asyncio.run(middleware(scope, _receive, _send))  # type: ignore[arg-type]
+
+        assert captured["is_dict"] is True
+        assert captured["prior_value"] == "must_survive"
+        assert captured["request_id"] is not None
+        assert isinstance(scope["state"], dict)
+
     def test_preserves_existing_state_attributes(self) -> None:
         """Middleware must add request_id without destroying prior State attributes.
 
