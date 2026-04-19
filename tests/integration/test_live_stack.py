@@ -72,6 +72,7 @@ def _spawn(
     *,
     port: int,
     extra_env: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
 ) -> subprocess.Popen[bytes]:
     """Launch ``uvicorn app_import`` as a detached subprocess.
 
@@ -81,6 +82,9 @@ def _spawn(
         port: TCP port to bind on 127.0.0.1.
         extra_env: Extra environment variables to pass to the child
             (layered on top of the current process env).
+        stdout_path: Optional file to which the child's stdout + stderr
+            are redirected. Used by the observability gate to inspect
+            structured log lines and span exports.
 
     Returns:
         The spawned :class:`subprocess.Popen` handle.
@@ -88,6 +92,14 @@ def _spawn(
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
+    stdout: int | object
+    stderr: int | object
+    if stdout_path is not None:
+        stdout = stdout_path.open("wb")  # closed implicitly when the proc exits
+        stderr = subprocess.STDOUT
+    else:
+        stdout = subprocess.DEVNULL
+        stderr = subprocess.DEVNULL
     return subprocess.Popen(
         [
             sys.executable,
@@ -103,8 +115,8 @@ def _spawn(
         ],
         cwd=_REPO_ROOT,
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=stdout,  # type: ignore[arg-type]
+        stderr=stderr,  # type: ignore[arg-type]
     )
 
 
@@ -263,6 +275,99 @@ async def test_live_stack_returns_200_via_real_sockets(
     assert data["meta"]["images_considered"] == 10
     assert data["meta"]["images_relevant"] == 10
     assert data["answer"].startswith("Q: what is happening? | IDs: ")
+
+
+async def test_live_stack_emits_structured_log_with_request_id(
+    tmp_path: Path,
+) -> None:
+    """Phase 7 observability gate.
+
+    Pipes the app's stdout to a file, sends one real request with a
+    pinned ``X-Request-Id``, and asserts:
+
+    - the response echoes the id in the ``X-Request-Id`` header
+    - the response body's ``meta.request_id`` matches
+    - at least one structured JSON log line carrying that id appears
+      on stdout (i.e. :func:`app.observability.logging.configure` ran
+      AND :class:`RequestIdMiddleware` bound the contextvar before the
+      handler logged)
+    """
+    import json
+
+    workflow_port = _free_port()
+    storage_port = _free_port()
+    app_port = _free_port()
+    log_path = tmp_path / "app-stdout.log"
+
+    workflow_proc = _spawn("mock_services.workflow_api.app:app", port=workflow_port)
+    storage_proc = _spawn("mock_services.storage_api.app:app", port=storage_port)
+    app_proc = _spawn(
+        "app.main:app",
+        port=app_port,
+        extra_env={
+            "WORKFLOW_API_URL": f"http://127.0.0.1:{workflow_port}",
+            "STORAGE_BASE_URL": f"http://127.0.0.1:{storage_port}",
+        },
+        stdout_path=log_path,
+    )
+    procs = [workflow_proc, storage_proc, app_proc]
+    try:
+        _wait_tcp_ready(workflow_port, workflow_proc, "workflow mock")
+        _wait_tcp_ready(storage_port, storage_proc, "storage mock")
+        _wait_tcp_ready(app_port, app_proc, "enriched-qa app")
+
+        pinned = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        body = {
+            "project_id": str(uuid4()),
+            "from": 1_700_000_000,
+            "to": 1_700_001_000,
+            "question": "gate",
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                f"http://127.0.0.1:{app_port}/enriched-qa",
+                json=body,
+                headers={"X-Request-Id": pinned},
+            )
+        assert response.status_code == 200, response.text
+        assert response.headers.get("x-request-id") == pinned
+        assert response.json()["meta"]["request_id"] == pinned
+
+        # Uvicorn may buffer stdout; poll until the expected id appears.
+        _wait_for_log(log_path, pinned, app_proc, timeout_s=10.0)
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+
+        matching_json = _first_json_line_with(text, pinned)
+        assert matching_json is not None, (
+            f"expected a structured JSON log line carrying request_id={pinned!r}; "
+            f"saw:\n{text[-2000:]}"
+        )
+        # The structured line must carry the three fields the logging
+        # configure pipeline adds (event name, level, timestamp) plus
+        # the bound request_id — prove structlog is actually wired.
+        parsed = json.loads(matching_json)
+        assert parsed.get("request_id") == pinned
+        assert parsed.get("level") in {"info", "warning", "error", "debug"}
+        assert "timestamp" in parsed
+        assert "event" in parsed
+    finally:
+        _terminate_all(procs)
+
+
+def _first_json_line_with(text: str, needle: str) -> str | None:
+    """Return the first JSON-parseable line in ``text`` containing ``needle``."""
+    import json
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or needle not in line:
+            continue
+        try:
+            json.loads(line)
+        except ValueError:
+            continue
+        return line
+    return None
 
 
 def test_run_mocks_script_launches_module_entrypoints_and_cleans_up(

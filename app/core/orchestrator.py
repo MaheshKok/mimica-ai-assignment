@@ -15,6 +15,9 @@ import asyncio
 import time
 from typing import TYPE_CHECKING
 
+import structlog
+from opentelemetry import trace
+
 from app.api.schemas import EnrichedQAResponse, Meta
 from app.core.errors import PartialFailureThresholdExceededError, StorageFetchError
 from app.core.models import ScreenshotWithBytes
@@ -26,6 +29,10 @@ if TYPE_CHECKING:
     from app.config import Settings
     from app.core.models import ScreenshotRef
     from app.deps import Ports
+
+
+_tracer = trace.get_tracer(__name__)
+_log = structlog.get_logger(__name__)
 
 
 async def run(
@@ -73,80 +80,129 @@ async def run(
     latency: dict[str, int] = {}
     t0 = time.perf_counter()
 
-    # 1. Stream + filter
-    stream_start = time.perf_counter()
-    refs = await _stream_and_filter(
-        ports,
-        req.project_id,
-        from_=req.from_,
-        to=req.to,
-        assume_sorted=config.assume_sorted_stream,
-    )
-    latency["stream"] = _elapsed_ms(stream_start)
+    with _tracer.start_as_current_span("enriched_qa.handler") as handler_span:
+        handler_span.set_attribute("project_id", str(req.project_id))
+        handler_span.set_attribute("time_window.from", req.from_)
+        handler_span.set_attribute("time_window.to", req.to)
+        handler_span.set_attribute("question.length", len(req.question))
 
-    images_considered = len(refs)
+        _log.info(
+            "enriched_qa.start",
+            project_id=str(req.project_id),
+            time_window_from=req.from_,
+            time_window_to=req.to,
+            question_length=len(req.question),
+        )
 
-    # 2. Empty-window short-circuit
-    if images_considered == 0:
+        # 1. Stream + filter
+        stream_start = time.perf_counter()
+        with _tracer.start_as_current_span("workflow.stream") as stream_span:
+            stream_span.set_attribute("project_id", str(req.project_id))
+            refs = await _stream_and_filter(
+                ports,
+                req.project_id,
+                from_=req.from_,
+                to=req.to,
+                assume_sorted=config.assume_sorted_stream,
+            )
+            stream_span.set_attribute("refs.in_window", len(refs))
+        latency["stream"] = _elapsed_ms(stream_start)
+
+        images_considered = len(refs)
+        handler_span.set_attribute("images_considered", images_considered)
+
+        # 2. Empty-window short-circuit
+        if images_considered == 0:
+            latency["total"] = _elapsed_ms(t0)
+            _log.info(
+                "enriched_qa.empty_window",
+                project_id=str(req.project_id),
+                latency_ms=latency,
+            )
+            return EnrichedQAResponse(
+                answer="",
+                meta=Meta(
+                    request_id=request_id,
+                    images_considered=0,
+                    images_relevant=0,
+                    errors={},
+                    latency_ms=latency,
+                ),
+            )
+
+        # 3. Pre-fetch sampling: cap work at MAX_RANK_INPUT by sampling over
+        # the request window. We sample `ScreenshotRef` values (not bytes)
+        # so timestamps survive and we never fetch images we'd discard.
+        refs_to_fetch = _sample_uniform_over_window(
+            refs,
+            from_=req.from_,
+            to=req.to,
+            max_input=config.max_rank_input,
+        )
+
+        # 4. Fetch with bounded concurrency + partial-failure counting
+        fetch_start = time.perf_counter()
+        with _tracer.start_as_current_span("storage.fetch_batch") as fetch_span:
+            fetch_span.set_attribute("refs.requested", len(refs_to_fetch))
+            fetch_span.set_attribute("max_concurrent", config.max_concurrent_fetches)
+            images, failed = await _fetch_all(
+                ports, refs_to_fetch, max_concurrent=config.max_concurrent_fetches
+            )
+            fetch_span.set_attribute("fetches.succeeded", len(images))
+            fetch_span.set_attribute("fetches.failed", failed)
+        latency["fetch"] = _elapsed_ms(fetch_start)
+
+        # 5. Partial-failure threshold (total > 0 here by construction)
+        total_fetches = len(refs_to_fetch)
+        if failed / total_fetches > config.max_fetch_failure_ratio:
+            raise PartialFailureThresholdExceededError(failed=failed, total=total_fetches)
+
+        errors: dict[str, int] = {}
+        if failed > 0:
+            errors["storage_fetch_failed"] = failed
+
+        # 6. Rank
+        rank_start = time.perf_counter()
+        with _tracer.start_as_current_span("relevance.rank") as rank_span:
+            rank_span.set_attribute("rank.input_size", len(images))
+            rank_span.set_attribute("rank.top_k", config.max_relevant_images)
+            relevant_ids = await ports.relevance.rank(
+                images, req.question, config.max_relevant_images
+            )
+            rank_span.set_attribute("rank.output_size", len(relevant_ids))
+        latency["rank"] = _elapsed_ms(rank_start)
+
+        # 7. QA
+        qa_start = time.perf_counter()
+        with _tracer.start_as_current_span("workflow.qa_answer") as qa_span:
+            qa_span.set_attribute("qa.relevant_count", len(relevant_ids))
+            answer = await ports.workflow.qa_answer(req.question, relevant_ids)
+            qa_span.set_attribute("qa.answer_length", len(answer))
+        latency["qa"] = _elapsed_ms(qa_start)
+
         latency["total"] = _elapsed_ms(t0)
+
+        handler_span.set_attribute("images_relevant", len(relevant_ids))
+        handler_span.set_attribute("fetches.failed", failed)
+        _log.info(
+            "enriched_qa.done",
+            project_id=str(req.project_id),
+            images_considered=images_considered,
+            images_relevant=len(relevant_ids),
+            fetches_failed=failed,
+            latency_ms=latency,
+        )
+
         return EnrichedQAResponse(
-            answer="",
+            answer=answer,
             meta=Meta(
                 request_id=request_id,
-                images_considered=0,
-                images_relevant=0,
-                errors={},
+                images_considered=images_considered,
+                images_relevant=len(relevant_ids),
+                errors=errors,
                 latency_ms=latency,
             ),
         )
-
-    # 3. Pre-fetch sampling: cap work at MAX_RANK_INPUT by sampling over
-    # the request window. We sample `ScreenshotRef` values (not bytes)
-    # so timestamps survive and we never fetch images we'd discard.
-    refs_to_fetch = _sample_uniform_over_window(
-        refs,
-        from_=req.from_,
-        to=req.to,
-        max_input=config.max_rank_input,
-    )
-
-    # 4. Fetch with bounded concurrency + partial-failure counting
-    fetch_start = time.perf_counter()
-    images, failed = await _fetch_all(
-        ports, refs_to_fetch, max_concurrent=config.max_concurrent_fetches
-    )
-    latency["fetch"] = _elapsed_ms(fetch_start)
-
-    # 5. Partial-failure threshold (total > 0 here by construction)
-    total_fetches = len(refs_to_fetch)
-    if failed / total_fetches > config.max_fetch_failure_ratio:
-        raise PartialFailureThresholdExceededError(failed=failed, total=total_fetches)
-
-    errors: dict[str, int] = {}
-    if failed > 0:
-        errors["storage_fetch_failed"] = failed
-
-    # 5. Rank
-    rank_start = time.perf_counter()
-    relevant_ids = await ports.relevance.rank(images, req.question, config.max_relevant_images)
-    latency["rank"] = _elapsed_ms(rank_start)
-
-    # 6. QA
-    qa_start = time.perf_counter()
-    answer = await ports.workflow.qa_answer(req.question, relevant_ids)
-    latency["qa"] = _elapsed_ms(qa_start)
-
-    latency["total"] = _elapsed_ms(t0)
-    return EnrichedQAResponse(
-        answer=answer,
-        meta=Meta(
-            request_id=request_id,
-            images_considered=images_considered,
-            images_relevant=len(relevant_ids),
-            errors=errors,
-            latency_ms=latency,
-        ),
-    )
 
 
 async def _stream_and_filter(

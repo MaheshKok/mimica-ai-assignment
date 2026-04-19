@@ -216,40 +216,38 @@ class TestRequestIdCorrelation:
 
     def test_error_envelope_request_id_stable_within_one_request(self) -> None:
         # Single request that triggers an error inside the orchestrator.
-        # The envelope's request_id must equal the id that was stashed on
-        # request.state before the orchestrator was called - i.e. the id
-        # the orchestrator received. The test asserts this via a
-        # middleware-free route by monkeypatching uuid4 to a fixed value.
-        import app.api.routes as routes_mod
-
+        # The envelope's request_id must equal the id the orchestrator
+        # received via ``request.state.request_id`` - i.e. the id the
+        # request-id middleware minted before the handler ran. Phase 7
+        # exposes that id via the inbound ``X-Request-Id`` header so
+        # tests can pin it without monkeypatching internals.
         fixed_id = "11111111-2222-3333-4444-555555555555"
-        original = routes_mod.uuid4
-        routes_mod.uuid4 = lambda: UUID(fixed_id)  # type: ignore[assignment]
-        try:
-            refs = [ScreenshotRef(timestamp=1, image_id="a")]
-            client = _install(
-                Ports(
-                    workflow=_RequestIdCapturingWorkflow(refs=refs),
-                    storage=FakeScreenshotStorage(images={"a": b"x"}),
-                    relevance=FakeRelevanceRanker(),
-                )
+        refs = [ScreenshotRef(timestamp=1, image_id="a")]
+        client = _install(
+            Ports(
+                workflow=_RequestIdCapturingWorkflow(refs=refs),
+                storage=FakeScreenshotStorage(images={"a": b"x"}),
+                relevance=FakeRelevanceRanker(),
             )
-            r = client.post(
-                "/enriched-qa",
-                json={
-                    "project_id": VALID_UUID,
-                    "from": 0,
-                    "to": 100,
-                    "question": "q",
-                },
-            )
-            assert r.status_code == 502
-            assert r.json()["request_id"] == fixed_id, (
-                "error envelope must use the same request_id the orchestrator "
-                "received (stashed on request.state), not a fresh uuid"
-            )
-        finally:
-            routes_mod.uuid4 = original
+        )
+        r = client.post(
+            "/enriched-qa",
+            json={
+                "project_id": VALID_UUID,
+                "from": 0,
+                "to": 100,
+                "question": "q",
+            },
+            headers={"X-Request-Id": fixed_id},
+        )
+        assert r.status_code == 502
+        assert r.json()["request_id"] == fixed_id, (
+            "error envelope must use the same request_id the orchestrator "
+            "received (stashed on request.state by the middleware)"
+        )
+        assert r.headers.get("x-request-id") == fixed_id, (
+            "response header must echo the same request_id"
+        )
 
 
 # --------------------------------------------------------------------------- #

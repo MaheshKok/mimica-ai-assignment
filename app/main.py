@@ -36,6 +36,9 @@ from app.core.errors import (
     WorkflowUpstreamError,
 )
 from app.deps import build_http_ports
+from app.observability import logging as obs_logging
+from app.observability import tracing as obs_tracing
+from app.observability.middleware import RequestIdMiddleware
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -130,6 +133,12 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     settings = Settings()
     application.state.settings = settings
 
+    # Observability startup: structured logs + OTel tracer provider.
+    # Both are idempotent, so test reloads and repeated `create_app`
+    # calls will not stack exporters.
+    obs_logging.configure()
+    obs_tracing.configure(settings)
+
     http_client = httpx.AsyncClient(
         limits=httpx.Limits(
             max_connections=_HTTPX_MAX_CONNECTIONS,
@@ -157,6 +166,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     finally:
         await http_client.aclose()
         process_pool.shutdown(wait=True, cancel_futures=True)
+        # Flush batched spans before the process exits. After this the
+        # global provider is a no-op; a subsequent lifespan enter reconfigures.
+        obs_tracing.shutdown()
 
 
 def create_app() -> FastAPI:
@@ -170,7 +182,15 @@ def create_app() -> FastAPI:
         and all domain-error handlers attached.
     """
     application = FastAPI(title="Enriched QA Service", lifespan=lifespan)
+    # Add RequestIdMiddleware BEFORE auto-instrumentation so the OTel
+    # server span is already started when our middleware sets its
+    # ``request_id`` attribute on it. Starlette applies middleware in
+    # reverse insertion order, so ``add_middleware`` here makes
+    # RequestIdMiddleware the outermost user middleware - the instrumentor
+    # wraps it with its own server-span middleware afterwards.
+    application.add_middleware(RequestIdMiddleware)
     application.include_router(router)
+    obs_tracing.instrument_app(application)
 
     @application.exception_handler(RequestValidationError)
     async def _on_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:

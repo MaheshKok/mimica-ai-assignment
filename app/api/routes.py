@@ -1,16 +1,18 @@
 """HTTP route handlers for the Enriched QA Service.
 
-Single route: ``POST /enriched-qa``. The handler owns three responsibilities
+Single route: ``POST /enriched-qa``. The handler owns two responsibilities
 the orchestrator does not:
 
-1. Generate a ``request_id`` and stash it on ``request.state`` so that
-   error-path exception handlers correlate to the same value the
-   orchestrator receives. Without this, a failure response would carry a
-   different id than the logs/spans produced during the pipeline.
-2. Enforce the per-request budget - wrap the orchestrator call in
+1. Enforce the per-request budget - wrap the orchestrator call in
    :func:`asyncio.timeout` sized by ``config.request_timeout_ms``. A
    :class:`TimeoutError` propagates to the 504 handler in :mod:`app.main`.
-3. Dependency-inject the :class:`Ports` bundle and :class:`Settings`.
+2. Dependency-inject the :class:`Ports` bundle and :class:`Settings`.
+
+``request_id`` is set by :class:`~app.observability.middleware.RequestIdMiddleware`
+before the handler runs - the handler reads ``request.state.request_id``
+rather than generating its own. This keeps the middleware as the single
+source of truth for the correlation id across logs, spans, and the
+response envelope.
 
 Exception mapping to the uniform envelope lives in :mod:`app.main` so
 the handler signature stays thin.
@@ -24,7 +26,6 @@ freely - the constraint only applies to FastAPI route signatures.
 
 import asyncio
 from typing import Annotated
-from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request
 
@@ -45,15 +46,14 @@ async def post_enriched_qa(
 ) -> EnrichedQAResponse:
     """Handle ``POST /enriched-qa``.
 
-    Generates a fresh ``request_id``, binds it to ``request.state`` so the
-    error handlers can read the same value, then wraps the orchestrator
-    call in a total-budget timeout taken from ``config.request_timeout_ms``.
-    Phase 7 replaces the generation with a middleware and the handler
-    reads from ``request.state.request_id`` directly.
+    Reads the correlation id stamped on ``request.state`` by the request-id
+    middleware and wraps the orchestrator call in a total-budget timeout
+    taken from ``config.request_timeout_ms``.
 
     Args:
-        request: Incoming request; used to stash ``request_id`` on
-            ``request.state`` so error envelopes carry the same value.
+        request: Incoming request; used to read the middleware-bound
+            ``request_id`` so the orchestrator and response envelope
+            share the same value.
         req: Validated request body.
         ports: Protocol-dependency bundle injected via :func:`get_ports`.
         config: Runtime settings injected via :func:`get_settings`.
@@ -70,7 +70,6 @@ async def post_enriched_qa(
         WorkflowUpstreamError: Propagated from the orchestrator. Maps to
             HTTP 502.
     """
-    request_id = str(uuid4())
-    request.state.request_id = request_id
+    request_id: str = request.state.request_id
     async with asyncio.timeout(config.request_timeout_ms / 1000):
         return await run(req, ports, config, request_id)

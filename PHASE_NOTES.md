@@ -443,3 +443,90 @@ Live stack (real uvicorn + real pool):
 ### Known gaps
 
 None. The pool shutdown path, broken-pool 503 path, and dispatch proof are all tested.
+
+---
+
+## Phase 7 — Observability
+
+### Status
+
+Complete. Gate satisfied: a real `POST /enriched-qa` through `uvicorn` prints
+a structured JSON log line carrying the caller-supplied `X-Request-Id`, and the
+orchestrator emits the five manual spans (`enriched_qa.handler`,
+`workflow.stream`, `storage.fetch_batch`, `relevance.rank`, `workflow.qa_answer`)
+on top of the auto-instrumented server/client spans.
+
+### What shipped
+
+| Component | Purpose |
+|---|---|
+| `app/observability/logging.py` | `configure(level=INFO)` — installs a structlog pipeline: `merge_contextvars`, `add_log_level`, `TimeStamper(iso, utc)`, `StackInfoRenderer`, `format_exc_info`, `JSONRenderer`. Also sets stdlib `logging.basicConfig(force=True)` so uvicorn's access log lands on the same stdout at the configured level. Idempotent — a second call does not stack processors. |
+| `app/observability/tracing.py` | `configure(settings, *, exporter=None)` — installs a global SDK `TracerProvider` with resource `service.name="enriched-qa-service"` and a single `BatchSpanProcessor`. Exporter priority: explicit arg > OTLP (when `OTEL_EXPORTER_OTLP_ENDPOINT` set) > `ConsoleSpanExporter`. `instrument_app(app)` attaches `FastAPIInstrumentor` per-app and `HTTPXClientInstrumentor` once globally. `shutdown()` flushes the provider AND resets OTel's private `_TRACER_PROVIDER_SET_ONCE` sentinel so a second `configure` in the same process (tests, uvicorn reload workers) installs a fresh provider instead of silently keeping the old one. |
+| `app/observability/middleware.py` | `RequestIdMiddleware` — pure ASGI middleware (not `BaseHTTPMiddleware`, which runs dispatch in a child task and drops contextvars in newer Starlette). On each HTTP scope: read inbound `X-Request-Id` or mint UUID4, stamp `scope["state"].request_id`, bind structlog contextvar, set `request_id` attribute on the current OTel span, wrap `send` to append `X-Request-Id` to the response headers, and reset the contextvar in `finally`. Non-HTTP scopes pass through untouched. |
+| `app/core/orchestrator.py` | Wraps `run` in `enriched_qa.handler` span with `project_id`, `time_window.{from,to}`, `question.length`, `images_considered`, `images_relevant`, `fetches.failed`. Nests `workflow.stream` (attr `refs.in_window`), `storage.fetch_batch` (`refs.requested`, `max_concurrent`, `fetches.succeeded`, `fetches.failed`), `relevance.rank` (`rank.input_size`, `rank.top_k`, `rank.output_size`), `workflow.qa_answer` (`qa.relevant_count`, `qa.answer_length`). Emits `enriched_qa.start`, `enriched_qa.empty_window`, `enriched_qa.done` structured log events. |
+| `app/api/routes.py` | No longer mints its own `request_id`. Reads `request.state.request_id` set by the middleware and passes it to `run`. The middleware is the single source of truth — error-envelope id, meta id, and log id are all the same value by construction. |
+| `app/main.py` lifespan | Calls `obs_logging.configure()` then `obs_tracing.configure(settings)` before wiring ports, `obs_tracing.instrument_app(application)` in `create_app` after `include_router`, and `obs_tracing.shutdown()` in the `finally` branch (after pool + client shutdown). |
+
+### Tests
+
+**+31 tests** (319 total, +1 integration). New files:
+
+- `tests/unit/test_obs_logging.py` (7 cases): one JSON object per call, `level` + `timestamp` + bound contextvars appear in every line, kwargs flow through, calling `configure` twice still produces one line per log, stdlib root logger level tracks the structlog level.
+- `tests/unit/test_obs_tracing.py` (8 cases): `configure` installs an SDK `TracerProvider`; idempotent `configure` returns the same provider; exporter selection picks `Console` without an endpoint and `OTLP` with one; a manual span flows through the injected in-memory exporter; `shutdown` + re-`configure` installs a fresh provider so a post-reconfigure span reaches the *new* exporter only; `shutdown` without a prior `configure` is a no-op; `instrument_app` is idempotent per FastAPI instance.
+- `tests/unit/test_obs_middleware.py` (9 cases): inbound `X-Request-Id` propagates to `state` and response header; missing or empty or whitespace-only header mints a fresh UUID4; two requests get distinct ids; the bound contextvar is visible during the handler; the contextvar is cleared after the request (no leak across requests); the id is set as an attribute on the active OTel span (checked via an outer manual span); non-HTTP scopes (lifespan) pass through untouched with no `state` mutation.
+- `tests/unit/test_orchestrator_spans.py` (4 cases): all five expected span names are emitted for a successful request; `enriched_qa.handler` records `images_considered` + `images_relevant` attributes; every span in the run shares one trace id; the empty-window short-circuit emits only `enriched_qa.handler` and `workflow.stream` — fetch/rank/qa are genuinely skipped.
+- `tests/unit/test_main.py` (+2 cases): lifespan leaves `tracing_mod._configured = True` and resets it on exit; every response carries an `X-Request-Id` header, proving the middleware is installed on the app.
+- `tests/unit/test_boundary_contracts.py` (updated): the route-level request-id pinning test now uses an inbound `X-Request-Id` header instead of monkeypatching `routes.uuid4` (the route no longer mints).
+- `tests/integration/test_live_stack.py` (+1 case): `test_live_stack_emits_structured_log_with_request_id` spawns uvicorn with a log-capturing stdout, sends one request with a pinned `X-Request-Id`, and asserts the response headers + body + at least one JSON log line on stdout all carry that id. Validates the end-to-end Phase 7 gate.
+
+### Verification
+
+```
+make test            319 passed in 3.82s   (+31 vs Phase 6)
+make test-cov        99.43% total (gate 93%, strict)
+make lint            ruff + flake8 clean
+make typecheck       mypy strict clean (33 source files)
+pre-commit run --all-files   all 11 hooks pass
+
+Live stack (real uvicorn + real pool + real spans):
+  tests/integration/test_live_stack.py — 4 passed, ~2s.
+  One pinned-request-id run ends with a JSON log line on stdout:
+    {"event":"enriched_qa.done","project_id":"...","images_considered":10,
+     "images_relevant":10,"fetches_failed":0,"latency_ms":{...},
+     "level":"info","timestamp":"...","request_id":"aaaaaaaa-..."}
+```
+
+### Deviations from `plan.md` / `architect.md`
+
+- Plan lists `RequestIdMiddleware` under `app/main.py`; implemented in its own
+  module `app/observability/middleware.py` to keep `create_app` thin and make
+  the middleware unit-testable without importing the whole app.
+- Chose a pure ASGI middleware over Starlette's `BaseHTTPMiddleware`.
+  `BaseHTTPMiddleware` runs its dispatch in a child task that does not
+  inherit contextvars in Starlette ≥ 0.36 — the structlog binding would be
+  invisible to the handler's log lines. Documented inline in the module
+  docstring.
+- `shutdown()` also resets `trace._TRACER_PROVIDER_SET_ONCE` (private OTel
+  state). Without this, a second `configure` after `shutdown` is silently
+  ignored and the service would re-use a dead provider on reload. The
+  tracing module docstring calls this out; the tests depend on it.
+- Log records expose `event`, `level`, `timestamp` top-level — the structlog
+  defaults — rather than a custom wrapper envelope. Observability tools
+  (Datadog, Elastic, Loki) already map those names.
+
+### Explicitly not done (per plan CUTs)
+
+- No metrics provider. Spans carry the cardinality attributes
+  (`images_considered`, `images_relevant`, `fetches.failed`) that a metrics
+  scraper would need; a real deployment would enable the OTel metrics SDK
+  with the same OTLP endpoint. Documented in `plan.md` §Phase 7 as a later
+  concern.
+- No sampling strategy. The default `ParentBased(TraceIdRatioBased(1.0))` is
+  left in place — Phase 7 is the "gate spans actually fire" phase, not the
+  "tune production cardinality" phase.
+
+### Known gaps
+
+None. The logging-configured, spans-emitted, and request-id-correlated
+contracts all have failing-on-regression tests at both unit and live-stack
+level.

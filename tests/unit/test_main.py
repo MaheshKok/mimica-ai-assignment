@@ -167,6 +167,39 @@ class TestLifespan:
             )
             assert ranker.max_input == app.state.settings.max_rank_input
 
+    def test_lifespan_configures_and_shuts_down_observability(self) -> None:
+        """Lifespan must configure tracing on startup and tear it down on exit.
+
+        A regression that removed ``obs_tracing.configure`` from the
+        lifespan would leave the service with OTel's proxy provider, so
+        manual spans in the orchestrator fall on the floor. Checking the
+        module flag is a compact way to assert the wiring without
+        reaching into the exporter's internals.
+        """
+        from app.main import app
+        from app.observability import tracing as tracing_mod
+
+        with TestClient(app):
+            assert tracing_mod._configured, "lifespan must call obs_tracing.configure(settings)"
+        # The lifespan finally branch must call shutdown(), otherwise
+        # batched spans are lost when the worker exits and the next
+        # configure cannot install a fresh provider.
+        assert not tracing_mod._configured, "lifespan must call obs_tracing.shutdown() on exit"
+
+    def test_request_id_middleware_installed(self) -> None:
+        """Route must respond with X-Request-Id header - middleware wired."""
+        from app.main import app
+
+        with TestClient(app) as client:
+            # Use an invalid payload so the request is cheap to process.
+            r = client.post(
+                "/enriched-qa",
+                json={"project_id": "bad", "from": 0, "to": 1, "question": "q"},
+            )
+            assert r.headers.get("x-request-id"), (
+                "every response must carry x-request-id; middleware missing?"
+            )
+
     def test_shuts_down_process_pool_on_exit(self) -> None:
         """Lifespan's finally branch must shut the pool down.
 
