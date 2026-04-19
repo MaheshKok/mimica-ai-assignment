@@ -40,6 +40,7 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from typing import IO
 
 
 pytestmark = pytest.mark.integration
@@ -73,7 +74,7 @@ def _spawn(
     port: int,
     extra_env: dict[str, str] | None = None,
     stdout_path: Path | None = None,
-) -> subprocess.Popen[bytes]:
+) -> tuple[subprocess.Popen[bytes], IO[bytes] | None]:
     """Launch ``uvicorn app_import`` as a detached subprocess.
 
     Args:
@@ -87,20 +88,24 @@ def _spawn(
             structured log lines and span exports.
 
     Returns:
-        The spawned :class:`subprocess.Popen` handle.
+        A tuple of (Popen handle, log file handle or None). The caller
+        must close the log file handle after the process exits to avoid
+        leaking the file descriptor.
     """
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    stdout: int | object
-    stderr: int | object
+    log_file: IO[bytes] | None = None
+    stdout: int | IO[bytes]
+    stderr: int | IO[bytes]
     if stdout_path is not None:
-        stdout = stdout_path.open("wb")  # closed implicitly when the proc exits
+        log_file = stdout_path.open("wb")
+        stdout = log_file
         stderr = subprocess.STDOUT
     else:
         stdout = subprocess.DEVNULL
         stderr = subprocess.DEVNULL
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -118,6 +123,7 @@ def _spawn(
         stdout=stdout,  # type: ignore[arg-type]
         stderr=stderr,  # type: ignore[arg-type]
     )
+    return proc, log_file
 
 
 def _wait_tcp_ready(
@@ -214,15 +220,15 @@ def live_stack() -> Iterator[dict[str, str]]:
     storage_url = f"http://127.0.0.1:{storage_port}"
     app_url = f"http://127.0.0.1:{app_port}"
 
-    workflow_proc = _spawn(
+    workflow_proc, _ = _spawn(
         "mock_services.workflow_api.app:app",
         port=workflow_port,
     )
-    storage_proc = _spawn(
+    storage_proc, _ = _spawn(
         "mock_services.storage_api.app:app",
         port=storage_port,
     )
-    app_proc = _spawn(
+    app_proc, _ = _spawn(
         "app.main:app",
         port=app_port,
         extra_env={
@@ -299,9 +305,9 @@ async def test_live_stack_emits_structured_log_with_request_id(
     app_port = _free_port()
     log_path = tmp_path / "app-stdout.log"
 
-    workflow_proc = _spawn("mock_services.workflow_api.app:app", port=workflow_port)
-    storage_proc = _spawn("mock_services.storage_api.app:app", port=storage_port)
-    app_proc = _spawn(
+    workflow_proc, _ = _spawn("mock_services.workflow_api.app:app", port=workflow_port)
+    storage_proc, _ = _spawn("mock_services.storage_api.app:app", port=storage_port)
+    app_proc, app_log_file = _spawn(
         "app.main:app",
         port=app_port,
         extra_env={
@@ -352,6 +358,8 @@ async def test_live_stack_emits_structured_log_with_request_id(
         assert "event" in parsed
     finally:
         _terminate_all(procs)
+        if app_log_file is not None:
+            app_log_file.close()
 
 
 def _first_json_line_with(text: str, needle: str) -> str | None:
