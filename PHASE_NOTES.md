@@ -310,3 +310,62 @@ Both adversarial reviewers converged on two real adapter bugs plus three polish 
 - ruff + flake8 + mypy all clean.
 - Live probe confirms: `get_image("../escape.png")` now hits `/images/..%2Fescape.png`; `get_image("img.png?token=secret")` hits `/images/img.png%3Ftoken%3Dsecret`; both no longer leak path/query semantics.
 - NDJSON bodies like `{"timestamp": true, ...}` and `{"timestamp": 1, "screenshot_url": null}` now yield zero refs instead of `ScreenshotRef(timestamp=1, image_id="None")`.
+
+---
+
+## Phase 5 — Separable mock services + full-stack integration tests
+
+### Status
+
+Complete. **Gate passed.** `make run-mocks` + `make run` + `curl` returns **HTTP 200** with a deterministic answer produced by the real HTTP adapters hitting real uvicorn-backed mock services over loopback.
+
+### What shipped
+
+| Component | Purpose |
+|---|---|
+| `mock_services/storage_api/app.py` | FastAPI app: `GET /images/{image_id:path}`. The `:path` type captures encoded segments (incl. `%2F`→`/`). Any id starting with `missing-` returns 404 for deterministic partial-failure tests. |
+| `mock_services/storage_api/__main__.py` | `python -m mock_services.storage_api` → uvicorn on 127.0.0.1:9100. |
+| `mock_services/workflow_api/app.py` | FastAPI app with `create_app(refs=...)` factory. `GET /projects/{id}/stream` streams NDJSON with a 1ms tick per row (real streaming exercise); `?shuffle=true` permutes deterministically via `Random(int(project_id))`. `POST /qa/answer` echoes `"Q: <q> | IDs: <csv>"` preserving received order. |
+| `mock_services/workflow_api/__main__.py` | `python -m mock_services.workflow_api` → uvicorn on 127.0.0.1:9000. |
+| `make run-mocks` | Starts both services in parallel, traps Ctrl-C to kill both. |
+
+### Tests
+
+**+17 tests** (254 total). Split across three layers:
+
+- `tests/unit/test_storage_mock.py` (5 tests): per-route mock behaviour via `httpx.ASGITransport`, including `{image_id:path}` decoding of `%2F`, `%3F`, and unicode.
+- `tests/unit/test_workflow_mock.py` (5 tests): NDJSON row shape, `?shuffle=true` determinism per-project, `create_app(refs=...)` factory, QA-echo order preservation, `422` on empty question.
+- `tests/integration/test_end_to_end.py` (7 tests, `@pytest.mark.integration`): the **real** stack — real FastAPI app, real HTTP adapters, real mock FastAPI apps, all wired via two layers of `httpx.ASGITransport` so every byte flows through httpx's request machinery without opening a socket.
+  - `TestHappyPath` — default 10 refs, shape contract (exactly `{answer, meta}` with the 5 expected meta keys).
+  - **`TestEncodedImageIds::test_ids_with_reserved_chars_round_trip`** — the headline adversarial case the reviewer asked for: 6 refs with `/`, `?`, space, `+`/`&`, and unicode image_ids. All round-trip through encode-decode-echo and appear verbatim in the final answer. Zero `storage_fetch_failed` entries — one drop would fail the test.
+  - `TestPartialFailure` — 1/10 missing succeeds with `meta.errors = {"storage_fetch_failed": 1}`; 5/10 missing returns 502 with the exact failed/total counts in `detail`.
+  - `TestStreamSortedAssumption` — `assume_sorted_stream=False` with out-of-order refs drains to EOF and still picks up the in-window rows.
+  - `TestOrderPreservation` — two identical requests produce the same `| IDs: …` tail, proving ranker order propagates through the wire and back.
+
+### Verification
+
+```
+make test            254 passed in 1.74s   (+17 vs Phase 4)
+make test-cov        100% coverage (gate 93%)
+make lint            ruff + flake8 clean
+make typecheck       mypy strict clean (29 source files)
+pre-commit run --all-files   all 11 hooks pass
+
+Live stack (real uvicorn):
+  $ make run-mocks &                           # workflow :9000, storage :9100
+  $ uv run uvicorn app.main:app --port 8001 &  # service
+  $ curl -X POST http://localhost:8001/enriched-qa -d '{...}'
+  HTTP 200
+  {"answer":"Q: what is happening? | IDs: img-005.png,img-006.png,...",
+   "meta":{"request_id":"e07f...","images_considered":10,"images_relevant":10,
+           "errors":{},"latency_ms":{"stream":21,"fetch":14,"rank":0,"qa":1,"total":37}}}
+```
+
+### Deviations from plan.md
+
+- Integration tests use `httpx.ASGITransport` instead of launching uvicorn sub-processes. Runs in the same event loop as the test, zero socket overhead, ~5× faster. Still exercises every httpx encoding/header/streaming code path the real wire would. The real-uvicorn path is verified separately via the live smoke above.
+- Pre-commit mypy env extended with `uvicorn[standard]` so the `__main__` modules type-check under the hook.
+
+### Known ergonomic gap
+
+- `make run-mocks` uses `trap ... ; wait` which requires bash-compatible shell semantics. On a system shell lacking job-control syntax the cleanup path won't fire. Not blocking — `make run-mocks` works on macOS/Linux zsh and bash.

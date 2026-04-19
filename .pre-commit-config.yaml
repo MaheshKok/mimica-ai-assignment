@@ -50,5 +50,6 @@ repos:
           - pydantic-settings>=2.3
           - structlog>=24.1
           - types-requests
+          - uvicorn[standard]>=0.30
         pass_filenames: false
         files: ^(app|mock_services)/
