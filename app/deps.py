@@ -19,12 +19,14 @@ make it misidentify ``request`` as a query parameter.
 """
 
 import asyncio
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import cast
 
 import httpx
 from fastapi import Request
 
+from app.adapters.relevance_cpu import CpuRelevanceRanker
 from app.adapters.relevance_fake import FakeRelevanceRanker
 from app.adapters.storage_fake import FakeScreenshotStorage
 from app.adapters.storage_http import HttpxScreenshotStorageClient
@@ -60,24 +62,28 @@ def build_http_ports(
     client: httpx.AsyncClient,
     settings: Settings,
     global_semaphore: asyncio.Semaphore,
+    process_pool: ProcessPoolExecutor,
 ) -> Ports:
     """Construct a :class:`Ports` bundle using the real HTTP adapters.
 
-    Phase 4 default wiring. Lifespan owns the ``httpx.AsyncClient`` and
-    the ``global_semaphore``; this factory just composes adapters from
-    them. No network call happens at construction time; the first call
-    is deferred to the first request.
+    Default wiring from Phase 4 onward. The lifespan owns the shared
+    ``httpx.AsyncClient``, the ``global_semaphore``, and (as of Phase 6)
+    the ``process_pool``; this factory just composes adapters from them.
+    No network call or worker spawn happens at construction time.
 
     Args:
         client: Shared async HTTP client.
-        settings: Active settings; supplies the Workflow and Storage
-            base URLs.
+        settings: Active settings; supplies base URLs and the defensive
+            ``max_rank_input`` bound forwarded to the ranker.
         global_semaphore: Process-wide storage concurrency cap. Injected
             into the storage adapter so every fetch honours it.
+        process_pool: Worker pool owned by the lifespan. Injected into
+            the relevance adapter so CPU-bound ranking never blocks the
+            event loop. Not closed here.
 
     Returns:
-        A :class:`Ports` bundle wiring the HTTP adapters and the
-        relevance ranker (fake for now; replaced in Phase 6).
+        A :class:`Ports` bundle with the HTTP workflow/storage adapters
+        and the process-pool-backed relevance ranker.
     """
     return Ports(
         workflow=HttpxWorkflowServicesClient(client=client, base_url=settings.workflow_api_url),
@@ -86,8 +92,10 @@ def build_http_ports(
             base_url=settings.storage_base_url,
             global_semaphore=global_semaphore,
         ),
-        # Phase 6 replaces this with the ProcessPoolExecutor-backed ranker.
-        relevance=FakeRelevanceRanker(),
+        relevance=CpuRelevanceRanker(
+            pool=process_pool,
+            max_input=settings.max_rank_input,
+        ),
     )
 
 

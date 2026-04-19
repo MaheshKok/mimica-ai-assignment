@@ -381,3 +381,59 @@ Two adversarial reviewers (Codex + second LLM) raised three findings after the i
 ### Known ergonomic gap
 
 - None remaining after the post-review fixes above. The `scripts/run_mocks.sh` path was smoke-verified on macOS bash 3.2.
+
+---
+
+## Phase 6 — CPU-bound relevance ranker
+
+### Status
+
+Complete. Gate from Phase 4 still green: the live `POST /enriched-qa` test runs the app with the real `ProcessPoolExecutor` and returns 200 end-to-end.
+
+### What shipped
+
+| Component | Purpose |
+|---|---|
+| `app/adapters/relevance_cpu.py` | `_rank_sync(image_ids, question, top_k) -> list[str]` — top-level, picklable, pure. Sorts by SHA-256 of `image_id\|question` and returns the top-k ids. Deterministic and question-sensitive. |
+| `app/adapters/relevance_cpu.py` | `CpuRelevanceRanker` — `RelevanceRanker`-shaped adapter. Holds a reference to the lifespan-owned `ProcessPoolExecutor`, dispatches via `loop.run_in_executor(pool, _rank_sync, ids, question, top_k)`, truncates input to `max_input` defensively. Ships only `image_ids` across the pool boundary so `ScreenshotWithBytes.data` payloads never cross the pickle wire; a real embedding ranker would flip that choice. |
+| `app/adapters/relevance_cpu.py` | `_current_process_name()` — test-observable helper that returns `multiprocessing.current_process().name`. Kept in the app module (not a test file) so `spawn`-start pickling is trivially safe, and only exists to let one test prove the work actually crosses the process boundary. |
+| `app/main.py` lifespan | Owns the pool: `ProcessPoolExecutor(max_workers=settings.filter_workers)`, stashed on `app.state.process_pool`, shut down with `wait=False, cancel_futures=True` in the `finally` branch so a slow rank cannot block teardown. `filter_workers=None` falls through to `os.cpu_count()` (Python default). |
+| `app/deps.py` | `build_http_ports(..., process_pool)` — new required kwarg. Constructs `CpuRelevanceRanker(pool=process_pool, max_input=settings.max_rank_input)` instead of `FakeRelevanceRanker`. Fakes remain available via `build_demo_ports()` for test scenarios that want a fully offline port bundle. |
+
+### Tests
+
+**+21 tests** (277 total). New file: `tests/unit/test_relevance_cpu.py`.
+
+- `TestRankSync` (9 cases): empty input, `top_k <= 0`, cap at `top_k`, bounded by input size, determinism, question-reorder, return-set subset-of-input, input-order-invariance.
+- `TestCpuRelevanceRanker` (9 cases): empty-input short-circuits (no pool dispatch), `top_k <= 0` short-circuits, cap at `top_k`, order matches `_rank_sync`, determinism across calls, question reorders, defensive truncation to `max_input` (asserts the first-N ids survive, oversized tail is dropped), result ids are a subset of input.
+- `TestPoolRunsInChildProcess` (2 cases): `_current_process_name()` submitted through the pool reports a non-`MainProcess` name (proves the work crosses); the same helper called inline returns `MainProcess` (bounds the hook's shape so the pool test isn't fooled by a hard-coded string).
+
+All tests derive from the `RelevanceRanker` Protocol's signature and the module docstring — none read `_rank_sync`'s body before asserting behaviour. The pool fixture is module-scoped to amortise the ~100ms worker spawn cost.
+
+### Verification
+
+```
+make test            277 passed in 2.76s   (+22 vs Phase 5)
+make test-cov        100% coverage (gate 93%, strict)
+make lint            ruff + flake8 clean
+make typecheck       mypy strict clean (30 source files)
+pre-commit run --all-files   all 11 hooks pass
+
+Live stack (real uvicorn + real pool):
+  tests/integration/test_live_stack.py — 3 passed, 1.90s.
+  The spawned app instantiates a real ProcessPoolExecutor in lifespan,
+  runs one `POST /enriched-qa`, the ranker dispatches to a child
+  worker, and the response envelope returns 200 with the full meta.
+```
+
+### Deviations from `plan.md`
+
+- Plan says "Input arriving here is already at most `MAX_RANK_INPUT` because Phase 4 samples before fetching" and "the ranker enforces the bound defensively but does not re-sample." Interpreted as: truncate to `max_input` from the head (no ValueError), since the orchestrator's pre-fetch sampling is the real enforcement point. A test (`test_truncates_to_max_input_without_resampling`) pins that choice.
+- `_rank_sync` takes `list[str]` ids, not `list[ScreenshotWithBytes]`. Shipping bytes across the pool is wasteful when this stand-in ranker does not read them; a real embedding-based ranker would accept the bytes instead. Documented in the function's docstring so the boundary is visible.
+- Plan's SHOULD case "test that the worker actually runs in a child process" is implemented via `_current_process_name` rather than a flag-on-`_rank_sync` hook; this keeps `_rank_sync` pure and gives the test two assertions (in-pool != MainProcess; inline == MainProcess) for the same hook.
+
+### Explicitly not done (per plan CUTs)
+
+- No `max_tasks_per_child`. Worker recycling is production hardening; not worth the multiprocessing-lifecycle debugging cost on a short timeline.
+- No event-loop-lag measurement under CPU load. Documented as an observation exercise, not a gate.
+- No real ML (CLIP, embeddings, weights). The ranker is a deterministic hash — the point is the process-pool plumbing, not model fidelity.

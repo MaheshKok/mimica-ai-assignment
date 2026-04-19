@@ -1,11 +1,12 @@
 """FastAPI application entry point.
 
 Exposes a :data:`app` global that ``uvicorn app.main:app`` picks up.
-The lifespan context **owns** the per-application resources - Phase 3
-stashes the :class:`~app.deps.Ports` bundle and :class:`~app.config.Settings`
-on ``app.state``, Phase 4 adds the shared ``httpx.AsyncClient``, Phase 6
-adds the ``ProcessPoolExecutor``. Dependencies resolve these from
-``request.app.state`` so nothing is owned at module scope.
+The lifespan context **owns** the per-application resources - the
+:class:`~app.deps.Ports` bundle, :class:`~app.config.Settings`, the
+shared :class:`httpx.AsyncClient` added in Phase 4, and (as of Phase 6)
+the :class:`~concurrent.futures.ProcessPoolExecutor` that backs the
+CPU-bound relevance ranker. Dependencies resolve every one of these
+from ``request.app.state`` so nothing is owned at module scope.
 
 Exception handlers map domain errors to the uniform ``{error, detail,
 request_id}`` envelope from ``architect.md`` section 7. The validation
@@ -17,6 +18,7 @@ sensitive request bodies are not reflected to callers.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -107,12 +109,16 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
       HTTP adapters. Connection caps match architect.md section 6.
     - ``global_fetch_semaphore``: the process-wide storage concurrency
       cap injected into the storage adapter.
-    - ``ports``: the :class:`Ports` bundle composed from HTTP adapters
-      plus the current (fake, Phase 6 replaces it) relevance ranker.
+    - ``process_pool``: the :class:`ProcessPoolExecutor` that backs the
+      CPU-bound relevance ranker. Sized by ``settings.filter_workers``
+      or ``os.cpu_count()`` when ``None``. Not recreated per request;
+      the pool is the ownership boundary for CPU-bound work.
+    - ``ports``: the :class:`Ports` bundle composed from the HTTP
+      adapters plus the pool-backed relevance ranker.
 
-    Cleanup closes the HTTP client on shutdown so connections drain
-    cleanly. Phase 6 adds ``ProcessPoolExecutor`` shutdown to the same
-    ``finally`` branch.
+    Cleanup closes the HTTP client and shuts the process pool down on
+    shutdown. ``cancel_futures=True`` drops any in-flight work so a
+    slow rank call cannot block server teardown.
     """
     settings = Settings()
     application.state.settings = settings
@@ -129,17 +135,21 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     global_fetch_semaphore = asyncio.Semaphore(settings.global_fetch_concurrency)
     application.state.global_fetch_semaphore = global_fetch_semaphore
 
+    process_pool = ProcessPoolExecutor(max_workers=settings.filter_workers)
+    application.state.process_pool = process_pool
+
     application.state.ports = build_http_ports(
         client=http_client,
         settings=settings,
         global_semaphore=global_fetch_semaphore,
+        process_pool=process_pool,
     )
 
     try:
         yield
     finally:
-        # Phase 6 adds process-pool shutdown here alongside http close.
         await http_client.aclose()
+        process_pool.shutdown(wait=False, cancel_futures=True)
 
 
 def create_app() -> FastAPI:
