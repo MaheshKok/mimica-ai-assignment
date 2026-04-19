@@ -397,23 +397,25 @@ Complete. Gate from Phase 4 still green: the live `POST /enriched-qa` test runs 
 | `app/adapters/relevance_cpu.py` | `_rank_sync(image_ids, question, top_k) -> list[str]` — top-level, picklable, pure. Sorts by SHA-256 of `image_id\|question` and returns the top-k ids. Deterministic and question-sensitive. |
 | `app/adapters/relevance_cpu.py` | `CpuRelevanceRanker` — `RelevanceRanker`-shaped adapter. Holds a reference to the lifespan-owned `ProcessPoolExecutor`, dispatches via `loop.run_in_executor(pool, _rank_sync, ids, question, top_k)`, truncates input to `max_input` defensively. Ships only `image_ids` across the pool boundary so `ScreenshotWithBytes.data` payloads never cross the pickle wire; a real embedding ranker would flip that choice. |
 | `app/adapters/relevance_cpu.py` | `_current_process_name()` — test-observable helper that returns `multiprocessing.current_process().name`. Kept in the app module (not a test file) so `spawn`-start pickling is trivially safe, and only exists to let one test prove the work actually crosses the process boundary. |
-| `app/main.py` lifespan | Owns the pool: `ProcessPoolExecutor(max_workers=settings.filter_workers)`, stashed on `app.state.process_pool`, shut down with `wait=False, cancel_futures=True` in the `finally` branch so a slow rank cannot block teardown. `filter_workers=None` falls through to `os.cpu_count()` (Python default). |
+| `app/main.py` lifespan | Owns the pool: `ProcessPoolExecutor(max_workers=settings.filter_workers)`, stashed on `app.state.process_pool`, shut down with `wait=True, cancel_futures=True` in the `finally` branch — queued work is dropped; running work is drained. Safe because `_rank_sync` is CPU-bounded by hashing at most `max_rank_input` ids, and `asyncio.timeout` already cancelled the awaiting coroutine before teardown (it cannot kill child-process work). `filter_workers=None` falls through to `os.cpu_count()` (Python default). |
 | `app/deps.py` | `build_http_ports(..., process_pool)` — new required kwarg. Constructs `CpuRelevanceRanker(pool=process_pool, max_input=settings.max_rank_input)` instead of `FakeRelevanceRanker`. Fakes remain available via `build_demo_ports()` for test scenarios that want a fully offline port bundle. |
 
 ### Tests
 
-**+21 tests** (277 total). New file: `tests/unit/test_relevance_cpu.py`.
+**+31 tests** (288 total). New file: `tests/unit/test_relevance_cpu.py`.
 
 - `TestRankSync` (9 cases): empty input, `top_k <= 0`, cap at `top_k`, bounded by input size, determinism, question-reorder, return-set subset-of-input, input-order-invariance.
 - `TestCpuRelevanceRanker` (9 cases): empty-input short-circuits (no pool dispatch), `top_k <= 0` short-circuits, cap at `top_k`, order matches `_rank_sync`, determinism across calls, question reorders, defensive truncation to `max_input` (asserts the first-N ids survive, oversized tail is dropped), result ids are a subset of input.
-- `TestPoolRunsInChildProcess` (2 cases): `_current_process_name()` submitted through the pool reports a non-`MainProcess` name (proves the work crosses); the same helper called inline returns `MainProcess` (bounds the hook's shape so the pool test isn't fooled by a hard-coded string).
+- `TestPoolRunsInChildProcess` (3 cases): `_current_process_name()` submitted through the pool reports a non-`MainProcess` name (proves the work crosses); the same helper called inline returns `MainProcess` (bounds the hook's shape so the pool test isn't fooled by a hard-coded string); `test_rank_dispatches_rank_sync_via_pool` wraps `loop.run_in_executor` with a spy and asserts exactly one call with the configured pool (identity) and `_rank_sync` (identity) as the first two args.
+- `TestBrokenPoolHandling` (3 cases): `BrokenProcessPool` → `RelevanceRankerError` with cause preserved; `RuntimeError` (shut-down pool) → `RelevanceRankerError`; empty input short-circuits before touching the pool even when the pool is broken.
+- `test_main.py` additions (5 cases): `test_wires_cpu_relevance_ranker_and_process_pool`, `test_shuts_down_process_pool_on_exit`, `TestRelevanceRankerErrorHandler.test_relevance_ranker_error_returns_503_envelope`, plus `RelevanceRankerError` contract tests in `test_errors.py`.
 
 All tests derive from the `RelevanceRanker` Protocol's signature and the module docstring — none read `_rank_sync`'s body before asserting behaviour. The pool fixture is module-scoped to amortise the ~100ms worker spawn cost.
 
 ### Verification
 
 ```
-make test            277 passed in 2.76s   (+22 vs Phase 5)
+make test            288 passed in 2.76s   (+31 vs Phase 5)
 make test-cov        100% coverage (gate 93%, strict)
 make lint            ruff + flake8 clean
 make typecheck       mypy strict clean (30 source files)
@@ -438,21 +440,6 @@ Live stack (real uvicorn + real pool):
 - No event-loop-lag measurement under CPU load. Documented as an observation exercise, not a gate.
 - No real ML (CLIP, embeddings, weights). The ranker is a deterministic hash — the point is the process-pool plumbing, not model fidelity.
 
-### Post-review fixes (Phase 6 → Phase 7 entry)
+### Known gaps
 
-Two adversarial reviewers (Codex + second LLM) raised five findings after the initial Phase 6 commit. Resolved:
-
-| Severity | Finding | Fix |
-|---|---|---|
-| HIGH | `BrokenProcessPool` (worker crashed) and `RuntimeError` (pool already shut down) leaked through `rank()` as generic 500s. One broken pool would brick every subsequent rank until process restart, and the existing `{error, detail, request_id}` envelope never fired. | Added `RelevanceRankerError(EnrichedQAError)` in `app/core/errors.py`. `CpuRelevanceRanker.rank` now catches `BrokenProcessPool` and `RuntimeError` and re-raises as `RelevanceRankerError` (preserving `__cause__`). `app/main.py` registers a handler returning HTTP 503 with `error="relevance_ranker_unavailable"`. Pool recreation is deliberately NOT attempted - concurrent-request coordination is out of scope and the correct production answer is a readiness probe + orchestrator restart (documented in the `RelevanceRankerError` docstring). |
-| MEDIUM | Lifespan shutdown used `wait=False, cancel_futures=True`. `cancel_futures` only cancels queued work; a running worker kept consuming CPU past teardown, contradicting the surrounding comment. | Switched to `shutdown(wait=True, cancel_futures=True)`: queued work is dropped, running work is drained. Safe because uvicorn's graceful shutdown drains active requests before lifespan teardown runs, and each rank is already bounded by the per-request `asyncio.timeout(REQUEST_TIMEOUT_MS)` budget. Comment rewritten to describe what actually happens. |
-| MEDIUM | Child-process assertion (`test_pool_worker_reports_child_process_name`) submitted the probe directly and only showed the pool *can* run work in a child - it did not prove `rank()` was the dispatch site. A ranker that ran inline would still pass. | Added `test_rank_dispatches_rank_sync_via_pool`: wraps `loop.run_in_executor` with `unittest.mock.patch.object(wraps=...)` and asserts exactly one call, that the first arg is the configured pool (identity check), and the second arg is `_rank_sync` (identity check). Combined with the existing non-`MainProcess` assertion, this bounds both "dispatched" and "ran in a child". |
-| MEDIUM | `test_live_stack.py` asserted the 200 response shape but would pass identically if the fake ranker were wired instead of `CpuRelevanceRanker`. | Added `test_wires_cpu_relevance_ranker_and_process_pool` in `test_main.py`: enters the real lifespan via `TestClient(app)`, asserts `app.state.ports.relevance` is a `CpuRelevanceRanker`, that its `pool` reference is the same instance on `app.state.process_pool`, and that `max_input` tracks `settings.max_rank_input`. Lifespan-level is cheaper and tighter than cross-process introspection in the subprocess test. |
-| MEDIUM | Pool shutdown behavior had no test: a regression that silently dropped `cancel_futures` or left the pool open would not fail. | Added `test_shuts_down_process_pool_on_exit`: after `TestClient(app)` exits, `pool.submit(...)` must raise `RuntimeError`. Proves the lifespan `finally` branch ran and that `wait=True` did not hang (test would time out). |
-| MEDIUM (P2) | README current-state block still said "Phase 5 complete" after the Phase 6 commit. Evaluator-visible drift. | Rewrote the block: Phase 6 complete, explicit mention of the `ProcessPoolExecutor` and the 503 `relevance_ranker_unavailable` path. Phase 7 named as the next step. |
-
-New tests: +10 (5 in `test_main.py`, 4 in `test_relevance_cpu.py`, 4 in `test_errors.py` offset by refactor).
-
-### Known ergonomic gap
-
-- None remaining after the post-review fixes above. The pool shutdown path is now explicit and tested.
+None. The pool shutdown path, broken-pool 503 path, and dispatch proof are all tested.

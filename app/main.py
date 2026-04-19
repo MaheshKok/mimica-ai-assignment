@@ -119,12 +119,13 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     Shutdown closes the HTTP client and then drains the process pool
     with ``wait=True, cancel_futures=True``: queued-but-not-started
-    tasks are dropped, and we block until running workers finish. The
-    per-request ``asyncio.timeout(REQUEST_TIMEOUT_MS)`` bounds how long
-    any individual rank can occupy a worker, and uvicorn's graceful
-    shutdown already waits for active requests before calling this
-    teardown - so ``wait=True`` does not hold the server open
-    indefinitely.
+    tasks are dropped, and we block until running workers finish.
+    ``asyncio.timeout`` only cancels the coroutine waiting on the
+    pool future — it cannot kill work already executing in the child
+    process. ``wait=True`` is safe because ``_rank_sync`` hashes at
+    most ``max_rank_input`` ids (a CPU-bounded, sub-second operation),
+    and uvicorn's graceful shutdown drains active requests before
+    lifespan teardown runs — so no rank arrives here still in flight.
     """
     settings = Settings()
     application.state.settings = settings
