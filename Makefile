@@ -11,7 +11,7 @@ install: sync  ## Install dependencies (evaluator entry point).
 sync:  ## Resolve and install dependencies via uv.
 	uv sync --all-groups
 
-run:  ## Run the FastAPI service (Phase 3+).
+run:  ## Run the FastAPI service on :8000 (reads .env; reload enabled).
 	uv run uvicorn app.main:app --reload --port 8000
 
 run-mocks:  ## Run both mock services with PID tracking, readiness probes, and fail-fast cleanup.

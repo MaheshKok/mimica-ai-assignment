@@ -39,9 +39,10 @@ POST /enriched-qa
             └── workflow.qa_answer — QA call with ranked ids
 ```
 
-For a full design walkthrough see [architect.md](docs/2_architectecture.md). The
-phase-by-phase decision log lives in
-[PHASE_NOTES.md](docs/4_implementation_notes.md).
+For a full design walkthrough see [architect.md](docs/2_architectecture.md).
+The historical implementation decision log lives in
+[implementation_notes.md](docs/4_implementation_notes.md) - kept as the
+build record; `app/` is the source of truth.
 
 ## Quickstart
 
@@ -177,27 +178,6 @@ make test-cov   -> 326 passed, 99.59% coverage
 make lint       -> ruff + flake8 passed
 make typecheck  -> mypy passed
 ```
-
-## Submission Notes
-
-Approximate time spent: about 3 hours of implementation time, plus additional
-review and hardening passes using LLM-assisted critique.
-
-With more time, I would replace the deterministic fake relevance ranker with a
-real image/text relevance model or embedding pipeline, add production metrics
-and dashboards, introduce health/readiness probes for the process pool and
-upstream dependencies, add retry/circuit-breaker policies around Workflow and
-Storage calls, containerise the service, and run load tests for burst traffic
-and large screenshot windows.
-
-Feedback on the challenge: the brief is realistic and well-scoped for showing
-async Python, clean boundaries, testability, and production judgment. The
-intentionally ambiguous areas — response shape, observability, mocking strategy,
-and partial-failure policy — are useful because they reveal engineering
-tradeoffs rather than only framework familiarity. The main improvement I would
-suggest is clarifying whether the Workflow stream is finite and timestamp-sorted
-or whether the service should pass time-window filters upstream; that one
-assumption has a large impact on correctness and resource usage.
 
 ## Observability
 

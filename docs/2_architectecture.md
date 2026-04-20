@@ -115,7 +115,7 @@ class RelevanceRanker(Protocol):
     ) -> list[str]: ...
 ```
 
-- `ScreenshotWithBytes(ref: ScreenshotRef, data: bytes)` — the wrapped `ref` keeps the timestamp available to the ranker, and keeps `ScreenshotRef` (the type flowing through the pipeline before fetch) as the thing sampling operates on. See `plan.md` Phase 4 pre-fetch sampling.
+- `ScreenshotWithBytes(ref: ScreenshotRef, data: bytes)` — the wrapped `ref` keeps the timestamp available to the ranker, and keeps `ScreenshotRef` (the type flowing through the pipeline before fetch) as the thing sampling operates on. Sampling happens before fetch so the timestamps are still present.
 - Returns at most `top_k` `image_id`s, **ordered most relevant first**.
 - "Most relevant" is a ranking problem, not a boolean filter. The default `top_k` is configurable via `MAX_RELEVANT_IMAGES` (default 20).
 - Implementation routes the CPU work through `loop.run_in_executor(ProcessPoolExecutor, ...)`. Callers never see the executor.
@@ -134,7 +134,7 @@ Additional rules:
 
 - NDJSON is parsed line-by-line via `aiter_lines()`; rows outside `[from, to)` are dropped without ever holding the full response.
 - One process-wide `ProcessPoolExecutor` sized to `os.cpu_count()` handles ranking. Worker recycling (`max_tasks_per_child`) is production hardening and deferred for this challenge.
-- Ranker input is capped (`MAX_RANK_INPUT`, default 500). Sampling happens on the `list[ScreenshotRef]` **before** fetch (see `plan.md` Phase 4), not after — so timestamps are still present and we avoid fetching images we'd immediately discard. Sampling is uniform over the `[from, to)` window. This is a pragmatic choice for this challenge — pickling 500 image blobs into a worker is not free, and the real system would co-locate or stream bytes differently.
+- Ranker input is capped (`MAX_RANK_INPUT`, default 500). Sampling happens on the `list[ScreenshotRef]` **before** fetch, not after — so timestamps are still present and we avoid fetching images we'd immediately discard. Sampling is uniform over the `[from, to)` window. This is a pragmatic choice for this challenge — pickling 500 image blobs into a worker is not free, and the real system would co-locate or stream bytes differently.
 - Every outbound hop has an explicit timeout. An overall request budget is enforced at the handler via `asyncio.timeout(...)`. Note: `asyncio.timeout` cancels the awaiting coroutine but cannot kill in-flight CPU work inside a worker process; bounding input size is what keeps ranker cost predictable.
 
 ---
@@ -276,7 +276,7 @@ Adapters are constructed once at startup. `app/deps.py` exposes FastAPI dependen
 
 Tests are derived from the contract (signatures, this architecture), not by mirroring implementation code.
 
-Tests are split by layer to keep each suite honest about what it owns (see `plan.md` Phase 8 for the full matrix):
+Tests are split by layer to keep each suite honest about what it owns:
 
 ### Orchestrator unit tests (Protocol fakes only)
 

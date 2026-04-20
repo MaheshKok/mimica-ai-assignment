@@ -2,8 +2,8 @@
 
 ``Settings`` is a :class:`~pydantic_settings.BaseSettings` subclass that
 reads environment variables with defaults matching ``architect.md``
-section 11. Using ``pydantic-settings`` from Phase 2 avoids a two-step
-migration later.
+section 11. ``pydantic-settings`` is used so env overrides, .env files,
+and type coercion all go through one validated entry point.
 """
 
 from __future__ import annotations

@@ -1,7 +1,8 @@
 """In-memory fake implementation of the ``ScreenshotStorageClient`` port.
 
-Used by unit tests and as the Phase 3 default dependency so ``make run``
-works before real HTTP adapters exist.
+Used by unit tests and by :func:`app.deps.build_demo_ports` for the
+fully-offline demo wiring. Lets the orchestrator run end-to-end without
+any network calls.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""Smoke tests verifying the Phase 1 scaffold.
+"""Smoke tests verifying the package layout.
 
 These tests prove that:
 
@@ -6,8 +6,9 @@ These tests prove that:
 - Every sub-package declared in the directory layout is present and importable.
 - ``app.__version__`` is exposed and is a non-empty string.
 
-They intentionally do not exercise any application logic - real tests arrive
-starting in Phase 2 (port/model contracts) and Phase 3 (orchestrator).
+They intentionally do not exercise any application logic - they catch
+import-time regressions (missing ``__init__.py``, broken top-level
+imports, version metadata stripped) before the behavioural suites run.
 """
 
 from __future__ import annotations

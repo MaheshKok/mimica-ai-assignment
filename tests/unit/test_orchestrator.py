@@ -1,8 +1,8 @@
 """Tests for :func:`app.core.orchestrator.run`.
 
 Written from the docstring of ``run`` and the pipeline contract in
-``plan.md`` Phase 3 / ``architect.md`` §4 and §8. Every scenario constructs
-fresh fakes so call counters reflect only this test's actions.
+``architect.md`` §4 and §8. Every scenario constructs fresh fakes so
+call counters reflect only this test's actions.
 """
 
 from __future__ import annotations

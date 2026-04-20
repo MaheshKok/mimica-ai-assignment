@@ -164,20 +164,19 @@ class TestHappyPath:
 
 
 # --------------------------------------------------------------------------- #
-# Encoded image IDs — the Phase 4 boundary                                    #
+# Encoded image IDs — the storage-adapter boundary                            #
 # --------------------------------------------------------------------------- #
 
 
 class TestEncodedImageIds:
     """Exercise the full chain with image_ids that contain URL-reserved chars.
 
-    This is the Phase 4 hardening verified end-to-end: the orchestrator
-    consumes the ref, the real storage adapter percent-encodes the id,
-    the storage mock decodes via ``{image_id:path}``, and the returned
-    bytes make it back to the ranker. Any drop or mis-decode surfaces
-    as a ``storage_fetch_failed`` entry in ``meta.errors`` - so a
-    passing test means the entire chain handled the identifier
-    verbatim.
+    Verifies the end-to-end chain: the orchestrator consumes the ref,
+    the real storage adapter percent-encodes the id, the storage mock
+    decodes via ``{image_id:path}``, and the returned bytes make it back
+    to the ranker. Any drop or mis-decode surfaces as a
+    ``storage_fetch_failed`` entry in ``meta.errors`` - so a passing
+    test means the entire chain handled the identifier verbatim.
     """
 
     async def test_ids_with_reserved_chars_round_trip(self) -> None:

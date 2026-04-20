@@ -6,11 +6,12 @@ owned by the FastAPI :func:`~app.main.lifespan` context and stashed on
 ``Request``, so every request reads the same live instances the lifespan
 built, and shutdown cleans them up in one place.
 
-Phase 3 populates :data:`app.state.ports` with in-memory fakes assembled
-by :func:`build_demo_ports`. Phase 4 replaces the lifespan body with
-construction of HTTP adapters around a shared ``httpx.AsyncClient``; no
-change to ``get_ports`` is needed because the dependency reads through
-``request.app.state``.
+The default wiring constructs HTTP adapters around a shared
+``httpx.AsyncClient`` via :func:`build_http_ports`.
+:func:`build_demo_ports` is an offline fallback composed of the in-memory
+fakes - useful for tests and for running the app without the mock
+services. Because the dependencies read through ``request.app.state``,
+swapping wiring is a single-line change in the lifespan.
 
 Note: this module intentionally does *not* use ``from __future__ import
 annotations``. FastAPI's dependency-analysis step classifies the
@@ -66,9 +67,9 @@ def build_http_ports(
 ) -> Ports:
     """Construct a :class:`Ports` bundle using the real HTTP adapters.
 
-    Default wiring from Phase 4 onward. The lifespan owns the shared
-    ``httpx.AsyncClient``, the ``global_semaphore``, and (as of Phase 6)
-    the ``process_pool``; this factory just composes adapters from them.
+    Default wiring used by ``make run``. The lifespan owns the shared
+    ``httpx.AsyncClient``, the ``global_semaphore``, and the
+    ``process_pool``; this factory just composes adapters from them.
     No network call or worker spawn happens at construction time.
 
     Args:
@@ -100,10 +101,10 @@ def build_http_ports(
 
 
 def build_demo_ports() -> Ports:
-    """Construct the Phase 3 fake port bundle.
+    """Construct a fully-offline demo port bundle from the in-memory fakes.
 
     Kept available for tests that want a fully-offline bundle; the
-    default `make run` path now uses :func:`build_http_ports`. Populates
+    default `make run` path uses :func:`build_http_ports`. Populates
     the workflow fake with three refs inside ``[1_000_000, 1_000_100)``
     and the storage fake with matching bytes.
 
@@ -166,10 +167,10 @@ def get_settings(request: Request) -> Settings:
 def get_ports(request: Request) -> Ports:
     """Return the :class:`Ports` bundle stashed on ``request.app.state``.
 
-    Lifespan owns the underlying resources (Phase 4: shared
-    ``httpx.AsyncClient``; Phase 6: ``ProcessPoolExecutor``) and closes
-    them cleanly on shutdown. This dependency stays stable across phases
-    because the ownership moved, not the reading.
+    Lifespan owns the underlying resources (the shared
+    ``httpx.AsyncClient`` and the ``ProcessPoolExecutor``) and closes
+    them cleanly on shutdown. This dependency only reads from
+    ``app.state`` so wiring changes never need to edit the resolver.
 
     Args:
         request: Incoming request; FastAPI injects it.

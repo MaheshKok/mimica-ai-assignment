@@ -1,7 +1,7 @@
-"""Adversarial tests for the Phase 3 route/handler boundary.
+"""Adversarial tests for the route/handler boundary.
 
-Each test proves one of three contracts that Phase 4's real adapters will
-sit behind. Without them, a real-network failure would either hang the
+Each test proves one of three contracts the real HTTP adapters sit
+behind. Without them, a real-network failure would either hang the
 service, return an uncorrelated error id, or reflect caller input:
 
 - ``asyncio.timeout`` actually enforces ``config.request_timeout_ms`` -
@@ -218,9 +218,9 @@ class TestRequestIdCorrelation:
         # Single request that triggers an error inside the orchestrator.
         # The envelope's request_id must equal the id the orchestrator
         # received via ``request.state.request_id`` - i.e. the id the
-        # request-id middleware minted before the handler ran. Phase 7
-        # exposes that id via the inbound ``X-Request-Id`` header so
-        # tests can pin it without monkeypatching internals.
+        # request-id middleware minted before the handler ran. The
+        # middleware exposes that id via the inbound ``X-Request-Id``
+        # header so tests can pin it without monkeypatching internals.
         fixed_id = "11111111-2222-3333-4444-555555555555"
         refs = [ScreenshotRef(timestamp=1, image_id="a")]
         client = _install(

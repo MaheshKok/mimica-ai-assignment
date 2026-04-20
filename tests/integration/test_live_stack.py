@@ -1,4 +1,4 @@
-"""Live-stack integration test - the Phase 5 production-wiring gate.
+"""Live-stack integration test - the production-wiring gate.
 
 Starts the workflow mock, storage mock, and the real FastAPI app as
 three ``uvicorn`` subprocesses on ephemeral TCP ports, waits for each
@@ -286,7 +286,7 @@ async def test_live_stack_returns_200_via_real_sockets(
 async def test_live_stack_emits_structured_log_with_request_id(
     tmp_path: Path,
 ) -> None:
-    """Phase 7 observability gate.
+    """Observability gate - end-to-end request-id propagation.
 
     Pipes the app's stdout to a file, sends one real request with a
     pinned ``X-Request-Id``, and asserts:

@@ -1,9 +1,9 @@
 """Tests for :mod:`app.main` — factory, lifespan, and TimeoutError mapping.
 
-The TimeoutError handler fires when anything inside the orchestrator (or a
-port it calls) raises :class:`TimeoutError`. Wiring a port that raises the
-error lets us verify the 504 envelope without needing Phase 4's
-``asyncio.timeout`` wrapper.
+The TimeoutError handler fires when anything inside the orchestrator (or
+a port it calls) raises :class:`TimeoutError`. Wiring a port that raises
+the error lets us verify the 504 envelope in isolation - without
+spinning up the real ``asyncio.timeout`` wrapper from the route.
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ class TestLifespan:
         assert client.is_closed, "lifespan must close the shared http client on shutdown"
 
     def test_wires_cpu_relevance_ranker_and_process_pool(self) -> None:
-        """Lifespan must wire the Phase 6 CPU ranker with the owned pool.
+        """Lifespan must wire the CPU ranker with the process pool it owns.
 
         Without this assertion, a regression that reverted to
         ``FakeRelevanceRanker`` (or never swapped it in) would pass the
@@ -159,7 +159,7 @@ class TestLifespan:
         with TestClient(app):
             ranker = app.state.ports.relevance
             assert isinstance(ranker, CpuRelevanceRanker), (
-                f"Phase 6 lifespan must wire CpuRelevanceRanker, got {type(ranker).__name__}"
+                f"lifespan must wire CpuRelevanceRanker, got {type(ranker).__name__}"
             )
             assert isinstance(app.state.process_pool, ProcessPoolExecutor)
             assert ranker.pool is app.state.process_pool, (

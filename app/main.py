@@ -3,8 +3,8 @@
 Exposes a :data:`app` global that ``uvicorn app.main:app`` picks up.
 The lifespan context **owns** the per-application resources - the
 :class:`~app.deps.Ports` bundle, :class:`~app.config.Settings`, the
-shared :class:`httpx.AsyncClient` added in Phase 4, and (as of Phase 6)
-the :class:`~concurrent.futures.ProcessPoolExecutor` that backs the
+shared :class:`httpx.AsyncClient`, and the
+:class:`~concurrent.futures.ProcessPoolExecutor` that backs the
 CPU-bound relevance ranker. Dependencies resolve every one of these
 from ``request.app.state`` so nothing is owned at module scope.
 

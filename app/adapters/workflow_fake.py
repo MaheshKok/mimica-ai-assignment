@@ -1,7 +1,8 @@
 """In-memory fake implementation of the ``WorkflowServicesClient`` port.
 
-Used by unit tests and by the Phase 3 default dependency wiring so the
-orchestrator runs end-to-end before Phase 4 introduces real httpx.
+Used by unit tests and by :func:`app.deps.build_demo_ports` for the
+fully-offline demo wiring. Lets the orchestrator run end-to-end without
+any network calls.
 """
 
 from __future__ import annotations

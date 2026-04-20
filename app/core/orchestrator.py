@@ -1,9 +1,8 @@
 """Core orchestration: stream → filter → (early-return-if-empty) → fetch → rank → QA.
 
-Implements the Phase 3 vertical slice described in ``plan.md``. The function
-:func:`run` is the single entry point the API handler calls; it takes only
-Protocol-level dependencies (``Ports``) and configuration, so it is testable
-without any HTTP or process-pool infrastructure.
+The function :func:`run` is the single entry point the API handler calls;
+it takes only Protocol-level dependencies (``Ports``) and configuration,
+so it is testable without any HTTP or process-pool infrastructure.
 
 See ``architect.md`` section 4 (stream handling), section 6 (concurrency),
 and section 8 (partial-failure policy) for the contract this implements.
