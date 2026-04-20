@@ -20,11 +20,11 @@ to select only this suite, or ``pytest`` to run everything.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
 import pytest
+from fastapi import FastAPI, Response
 
 from app.adapters.relevance_fake import FakeRelevanceRanker
 from app.adapters.storage_http import HttpxScreenshotStorageClient
@@ -34,10 +34,6 @@ from app.deps import Ports, get_ports, get_settings
 from app.main import app
 from mock_services.storage_api.app import create_app as create_storage_app
 from mock_services.workflow_api.app import create_app as create_workflow_app
-
-if TYPE_CHECKING:
-    from fastapi import FastAPI
-
 
 pytestmark = pytest.mark.integration
 
@@ -305,3 +301,156 @@ class TestOrderPreservation:
         tail1 = r1.json()["answer"].split("| IDs: ")[1]
         tail2 = r2.json()["answer"].split("| IDs: ")[1]
         assert tail1 == tail2
+
+
+# --------------------------------------------------------------------------- #
+# Cross-request concurrency                                                   #
+# --------------------------------------------------------------------------- #
+
+
+class TestConcurrentRequests:
+    """Burst coverage — prove no cross-request leakage under load.
+
+    Production wires ONE ``Ports`` bundle on ``app.state`` and reuses it
+    for every request: the same shared ``httpx.AsyncClient``, the same
+    process-wide storage semaphore, the same ``ProcessPoolExecutor``.
+    Single-request tests can't catch:
+
+    - request_id contextvar bleeding between concurrent requests,
+    - the storage semaphore being accidentally scoped per-request
+      instead of process-wide,
+    - any other global state mutated per-request without isolation.
+
+    These tests fire multiple requests through one shared stack via
+    :func:`asyncio.gather` so the only way they all pass is if the
+    wiring is genuinely concurrent-safe.
+    """
+
+    async def test_ten_concurrent_requests_all_succeed(self) -> None:
+        """Ten concurrent ``/enriched-qa`` calls through one shared stack.
+
+        Asserts all 200s, all request_ids distinct (contextvar
+        isolation), and each response sees the full ten-ref mock stream
+        with zero fetch failures.
+        """
+        workflow_mock = create_workflow_app()
+        storage_app = create_storage_app()
+        wf_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=workflow_mock),
+            base_url="http://workflow.mock",
+        )
+        st_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=storage_app),
+            base_url="http://storage.mock",
+        )
+        ports = Ports(
+            workflow=HttpxWorkflowServicesClient(wf_client, "http://workflow.mock"),
+            storage=HttpxScreenshotStorageClient(
+                st_client, "http://storage.mock", asyncio.Semaphore(100)
+            ),
+            relevance=FakeRelevanceRanker(),
+        )
+        app.dependency_overrides[get_ports] = lambda: ports
+        app.dependency_overrides[get_settings] = lambda: _settings()
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://app.test",
+            ) as client:
+                responses = await asyncio.gather(
+                    *(client.post("/enriched-qa", json=_body(question=f"q-{i}")) for i in range(10))
+                )
+        finally:
+            app.dependency_overrides.clear()
+            await wf_client.aclose()
+            await st_client.aclose()
+
+        # All succeed.
+        failures = [(r.status_code, r.text) for r in responses if r.status_code != 200]
+        assert not failures, f"concurrent burst had failures: {failures}"
+
+        # request_ids must be unique — proves the middleware's contextvar
+        # binding is per-request, not leaked across the gather.
+        request_ids = [r.json()["meta"]["request_id"] for r in responses]
+        assert len(set(request_ids)) == 10, (
+            f"concurrent requests produced duplicate request_ids: {request_ids}"
+        )
+
+        # Every request saw the full mock stream with no losses.
+        for r in responses:
+            data = r.json()
+            assert data["meta"]["images_considered"] == 10
+            assert data["meta"]["images_relevant"] == 10
+            assert data["meta"]["errors"] == {}
+
+    async def test_global_semaphore_caps_across_concurrent_requests(self) -> None:
+        """Shared storage semaphore caps total in-flight fetches across requests.
+
+        Five concurrent requests, each needing ten fetches, would drive
+        up to fifty simultaneous storage calls without a cap. With a
+        shared semaphore of three, peak observed concurrency at the
+        instrumented storage handler must never exceed three. Catches
+        any regression where the semaphore is scoped per-orchestrator
+        or per-request instead of process-wide.
+        """
+        tracker = {"count": 0, "peak": 0}
+        instrumented = FastAPI()
+
+        @instrumented.get("/images/{image_id:path}")
+        async def _instrumented_get(image_id: str) -> Response:
+            tracker["count"] += 1
+            tracker["peak"] = max(tracker["peak"], tracker["count"])
+            try:
+                # Yield control so concurrent handlers pile up at the
+                # semaphore boundary and peak has a chance to climb.
+                await asyncio.sleep(0.01)
+                return Response(
+                    content=f"fake-image::{image_id}".encode(),
+                    media_type="application/octet-stream",
+                )
+            finally:
+                tracker["count"] -= 1
+
+        workflow_mock = create_workflow_app()
+        wf_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=workflow_mock),
+            base_url="http://workflow.mock",
+        )
+        st_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=instrumented),
+            base_url="http://storage.mock",
+        )
+        shared_sem = asyncio.Semaphore(3)
+        ports = Ports(
+            workflow=HttpxWorkflowServicesClient(wf_client, "http://workflow.mock"),
+            storage=HttpxScreenshotStorageClient(st_client, "http://storage.mock", shared_sem),
+            relevance=FakeRelevanceRanker(),
+        )
+        app.dependency_overrides[get_ports] = lambda: ports
+        app.dependency_overrides[get_settings] = lambda: _settings()
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://app.test",
+            ) as client:
+                responses = await asyncio.gather(
+                    *(client.post("/enriched-qa", json=_body(question=f"q-{i}")) for i in range(5))
+                )
+        finally:
+            app.dependency_overrides.clear()
+            await wf_client.aclose()
+            await st_client.aclose()
+
+        assert all(r.status_code == 200 for r in responses), [
+            r.text for r in responses if r.status_code != 200
+        ]
+        assert tracker["peak"] <= 3, (
+            f"global semaphore failed to cap across requests: "
+            f"peak={tracker['peak']} exceeded cap of 3"
+        )
+        # Sanity: prove the test actually exercised parallelism. If peak
+        # stayed at 1 the assertion above passes trivially and proves
+        # nothing; fail loud instead.
+        assert tracker["peak"] >= 2, (
+            f"no cross-request parallelism observed: peak={tracker['peak']}; test is degenerate"
+        )
