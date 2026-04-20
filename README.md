@@ -7,42 +7,9 @@ from object storage in parallel, ranks them for relevance using a CPU-bound
 worker pool, and forwards the shortlisted identifiers to a QA backend — all
 within a single request lifetime.
 
-## Features
+## [architectecture_diagram](docs/2_architecture_diagram.excalidraw)
 
-- **Request correlation** — inbound `X-Request-Id` is honoured or a UUID4 is
-  minted; the id propagates through response headers, the response body, every
-  log line, and the active OpenTelemetry span.
-- **Structured logging** — all output is newline-delimited JSON
-  (`event`, `level`, `timestamp`, `request_id`, plus any handler-bound fields).
-  Stdlib loggers (uvicorn, httpx) are routed through the same structlog
-  pipeline so no log line is plain text.
-- **Distributed tracing** — five manual spans (`enriched_qa.handler`,
-  `workflow.stream`, `storage.fetch_batch`, `relevance.rank`,
-  `workflow.qa_answer`) nest under the auto-instrumented FastAPI server span;
-  `httpx` client spans are attached automatically for every upstream call.
-- **Process-pool ranker** — relevance ranking runs on a
-  lifespan-managed `ProcessPoolExecutor` to keep the async event loop free;
-  pool failure surfaces as HTTP 503 (`relevance_ranker_unavailable`).
-- **Graceful error envelopes** — all error responses share a consistent shape
-  (`error`, `detail`, `request_id`) and timeouts, upstream failures, and
-  validation errors each map to a distinct error code.
-
-## Architecture
-
-```
-POST /enriched-qa
-    └── RequestIdMiddleware (bind request_id)
-        └── enriched_qa.handler span
-            ├── workflow.stream   — NDJSON stream of image refs
-            ├── storage.fetch_batch — parallel binary fetches
-            ├── relevance.rank   — CPU-bound worker pool
-            └── workflow.qa_answer — QA call with ranked ids
-```
-
-For a full design walkthrough see [architect.md](docs/2_architectecture.md).
-The historical implementation decision log lives in
-[implementation_notes.md](docs/4_implementation_notes.md) - kept as the
-build record; `app/` is the source of truth.
+![img.png](img.png)
 
 ## Quickstart
 
@@ -56,20 +23,12 @@ git clone <github-repository-url>
 cd mimicaai-assignment
 ```
 
-```bash
-make install   # uv sync — installs all dependencies
-make test      # run pytest (all suites)
-make test-cov  # run pytest with 93% coverage gate
-make lint      # ruff + flake8
-make typecheck # mypy strict
-```
-
-`make install` does not install git hooks, so it works from a zipped
-submission without a `.git` directory.
 
 ## Running the live stack
 
 ```bash
+make install   # uv sync — installs all dependencies
+
 # Terminal 1 — workflow mock (:9000) and storage mock (:9100)
 make run-mocks
 
@@ -109,6 +68,23 @@ The upstream URLs are configurable via `WORKFLOW_API_URL` and
 `STORAGE_BASE_URL` — see `.env.example`. Mock ports can be overridden via
 `WORKFLOW_PORT` / `STORAGE_PORT` before `make run-mocks`.
 
+
+### Testing against the assignment criteria
+
+| Assignment criterion | How it is covered |
+|---|---|
+| REST service accepts project/time-window/question input | `tests/unit/test_schemas.py` validates the request body, aliases the wire field `from` to `from_`, enforces `from < to`, and rejects invalid UUIDs or empty questions. `tests/unit/test_routes.py` verifies FastAPI accepts the literal assignment payload shape. |
+| Workflow API NDJSON stream is consumed asynchronously | `tests/unit/test_workflow_http.py` exercises streaming with `httpx.MockTransport`, including valid rows, malformed rows, missing fields, and non-2xx/transport failures. |
+| Images are retrieved from an async, separable storage service | `mock_services/storage_api` is a standalone FastAPI service. `tests/unit/test_storage_http.py` verifies async HTTP fetching, URL-safe image identifiers, error translation, and process-wide concurrency limiting. |
+| Relevance filtering is CPU-intensive and swappable | `app/ports/relevance.py` defines the ranker Protocol. `tests/unit/test_relevance_cpu.py` proves the concrete ranker dispatches work through a `ProcessPoolExecutor`; `tests/unit/test_relevance_fake.py` covers the deterministic fake used in fast unit tests. |
+| Core service does not depend on concrete clients | `tests/unit/test_ports.py` and `tests/unit/test_deps.py` verify the Protocol/fake wiring. The orchestrator tests use only the `Ports` bundle, not HTTP implementations. |
+| Correct end-to-end flow: stream → filter → fetch → rank → QA | `tests/unit/test_orchestrator.py` covers the core pipeline, empty-window short-circuit, `[from, to)` boundary behavior, sorted-stream assumption, partial-failure threshold, sampling before fetch, order preservation, and concurrency bounds. |
+| Workflow `/qa/answer` receives ranked image identifiers | `tests/unit/test_workflow_http.py` verifies the POST body. `tests/unit/test_orchestrator.py::TestOrderPreservation` verifies ranker order is passed to QA unchanged. |
+| Observability is appropriate for production-style debugging | `tests/unit/test_obs_middleware.py`, `tests/unit/test_obs_logging.py`, `tests/unit/test_obs_tracing.py`, and `tests/unit/test_orchestrator_spans.py` cover request-id propagation, structured logs, tracing configuration, and manual pipeline spans. |
+| The stack can be tested without external paid services | `tests/integration/test_end_to_end.py` runs the app with in-process ASGI mocks. `tests/integration/test_live_stack.py` starts the app and both mock services as real `uvicorn` subprocesses over TCP. |
+| Quality gates are reproducible by reviewers | `make test`, `make test-cov`, `make lint`, and `make typecheck` are the reviewer entry points. The coverage gate is configured at 93% branch coverage. |
+
+
 ### Troubleshooting: mocks not running
 
 Running the app without the mocks produces a **502 `workflow_upstream_failure`**:
@@ -125,7 +101,7 @@ This shape confirms that routing, request-id correlation, and the error envelope
 are all wired correctly — only the upstream is absent. Start `make run-mocks`
 and retry.
 
-## Testing
+## Unit Testing
 
 ```bash
 make test       # full suite
@@ -155,21 +131,6 @@ The integration suite has two layers:
   carrying the inbound `X-Request-Id` is present, proving the observability
   pipeline is wired end-to-end.
 
-### Testing against the assignment criteria
-
-| Assignment criterion | How it is covered |
-|---|---|
-| REST service accepts project/time-window/question input | `tests/unit/test_schemas.py` validates the request body, aliases the wire field `from` to `from_`, enforces `from < to`, and rejects invalid UUIDs or empty questions. `tests/unit/test_routes.py` verifies FastAPI accepts the literal assignment payload shape. |
-| Workflow API NDJSON stream is consumed asynchronously | `tests/unit/test_workflow_http.py` exercises streaming with `httpx.MockTransport`, including valid rows, malformed rows, missing fields, and non-2xx/transport failures. |
-| Images are retrieved from an async, separable storage service | `mock_services/storage_api` is a standalone FastAPI service. `tests/unit/test_storage_http.py` verifies async HTTP fetching, URL-safe image identifiers, error translation, and process-wide concurrency limiting. |
-| Relevance filtering is CPU-intensive and swappable | `app/ports/relevance.py` defines the ranker Protocol. `tests/unit/test_relevance_cpu.py` proves the concrete ranker dispatches work through a `ProcessPoolExecutor`; `tests/unit/test_relevance_fake.py` covers the deterministic fake used in fast unit tests. |
-| Core service does not depend on concrete clients | `tests/unit/test_ports.py` and `tests/unit/test_deps.py` verify the Protocol/fake wiring. The orchestrator tests use only the `Ports` bundle, not HTTP implementations. |
-| Correct end-to-end flow: stream → filter → fetch → rank → QA | `tests/unit/test_orchestrator.py` covers the core pipeline, empty-window short-circuit, `[from, to)` boundary behavior, sorted-stream assumption, partial-failure threshold, sampling before fetch, order preservation, and concurrency bounds. |
-| Workflow `/qa/answer` receives ranked image identifiers | `tests/unit/test_workflow_http.py` verifies the POST body. `tests/unit/test_orchestrator.py::TestOrderPreservation` verifies ranker order is passed to QA unchanged. |
-| Observability is appropriate for production-style debugging | `tests/unit/test_obs_middleware.py`, `tests/unit/test_obs_logging.py`, `tests/unit/test_obs_tracing.py`, and `tests/unit/test_orchestrator_spans.py` cover request-id propagation, structured logs, tracing configuration, and manual pipeline spans. |
-| The stack can be tested without external paid services | `tests/integration/test_end_to_end.py` runs the app with in-process ASGI mocks. `tests/integration/test_live_stack.py` starts the app and both mock services as real `uvicorn` subprocesses over TCP. |
-| Quality gates are reproducible by reviewers | `make test`, `make test-cov`, `make lint`, and `make typecheck` are the reviewer entry points. The coverage gate is configured at 93% branch coverage. |
-
 The latest local verification before submission was:
 
 ```text
@@ -178,6 +139,10 @@ make test-cov   -> 326 passed, 99.59% coverage
 make lint       -> ruff + flake8 passed
 make typecheck  -> mypy passed
 ```
+
+`make install` does not install git hooks, so it works from a zipped
+submission without a `.git` directory.
+
 
 ## Observability
 
@@ -199,10 +164,39 @@ UTC), plus bound contextvars and any handler-supplied fields. Stdlib loggers
 from uvicorn and httpx are routed through the same structlog pipeline via
 `ProcessorFormatter`, so no log line bypasses request-id correlation.
 
-## Contributing
+## Features
 
-To enable commit-time guardrails in a cloned repo:
+- **Request correlation** — inbound `X-Request-Id` is honoured or a UUID4 is
+  minted; the id propagates through response headers, the response body, every
+  log line, and the active OpenTelemetry span.
+- **Structured logging** — all output is newline-delimited JSON
+  (`event`, `level`, `timestamp`, `request_id`, plus any handler-bound fields).
+  Stdlib loggers (uvicorn, httpx) are routed through the same structlog
+  pipeline so no log line is plain text.
+- **Distributed tracing** — five manual spans (`enriched_qa.handler`,
+  `workflow.stream`, `storage.fetch_batch`, `relevance.rank`,
+  `workflow.qa_answer`) nest under the auto-instrumented FastAPI server span;
+  `httpx` client spans are attached automatically for every upstream call.
+- **Process-pool ranker** — relevance ranking runs on a
+  lifespan-managed `ProcessPoolExecutor` to keep the async event loop free;
+  pool failure surfaces as HTTP 503 (`relevance_ranker_unavailable`).
+- **Graceful error envelopes** — all error responses share a consistent shape
+  (`error`, `detail`, `request_id`) and timeouts, upstream failures, and
+  validation errors each map to a distinct error code.
 
-```bash
-make hooks   # installs pre-commit hooks — no-op if .git is absent
+## Architecture
+
 ```
+POST /enriched-qa
+    └── RequestIdMiddleware (bind request_id)
+        └── enriched_qa.handler span
+            ├── workflow.stream   — NDJSON stream of image refs
+            ├── storage.fetch_batch — parallel binary fetches
+            ├── relevance.rank   — CPU-bound worker pool
+            └── workflow.qa_answer — QA call with ranked ids
+```
+
+For a full design walkthrough see [architect.md](docs/2_architectecture.md).
+The historical implementation decision log lives in
+[implementation_notes.md](docs/4_implementation_notes.md) - kept as the
+build record; `app/` is the source of truth.
