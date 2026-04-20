@@ -33,19 +33,27 @@ within a single request lifetime.
 POST /enriched-qa
     └── RequestIdMiddleware (bind request_id)
         └── enriched_qa.handler span
-            ├── workflow.stream   — SSE stream of image refs
+            ├── workflow.stream   — NDJSON stream of image refs
             ├── storage.fetch_batch — parallel binary fetches
             ├── relevance.rank   — CPU-bound worker pool
             └── workflow.qa_answer — QA call with ranked ids
 ```
 
-For a full design walkthrough see [architect.md](2_architect.md). The
-phase-by-phase decision log lives in [PHASE_NOTES.md](4_implementation_notes.md).
+For a full design walkthrough see [architect.md](docs/2_architectecture.md). The
+phase-by-phase decision log lives in
+[PHASE_NOTES.md](docs/4_implementation_notes.md).
 
 ## Quickstart
 
 Python 3.12 required. Dependencies are managed with
 [`uv`](https://docs.astral.sh/uv/).
+
+If reviewing from GitHub instead of a zip archive:
+
+```bash
+git clone <github-repository-url>
+cd mimicaai-assignment
+```
 
 ```bash
 make install   # uv sync — installs all dependencies
@@ -107,7 +115,7 @@ Running the app without the mocks produces a **502 `workflow_upstream_failure`**
 ```json
 {
   "error": "workflow_upstream_failure",
-  "detail": "workflow upstream error: All connection attempts failed",
+  "detail": "Workflow Services API request failed.",
   "request_id": "<uuid>"
 }
 ```
@@ -145,6 +153,51 @@ The integration suite has two layers:
   every hop. One case pipes app stdout to a file and asserts a JSON log line
   carrying the inbound `X-Request-Id` is present, proving the observability
   pipeline is wired end-to-end.
+
+### Testing against the assignment criteria
+
+| Assignment criterion | How it is covered |
+|---|---|
+| REST service accepts project/time-window/question input | `tests/unit/test_schemas.py` validates the request body, aliases the wire field `from` to `from_`, enforces `from < to`, and rejects invalid UUIDs or empty questions. `tests/unit/test_routes.py` verifies FastAPI accepts the literal assignment payload shape. |
+| Workflow API NDJSON stream is consumed asynchronously | `tests/unit/test_workflow_http.py` exercises streaming with `httpx.MockTransport`, including valid rows, malformed rows, missing fields, and non-2xx/transport failures. |
+| Images are retrieved from an async, separable storage service | `mock_services/storage_api` is a standalone FastAPI service. `tests/unit/test_storage_http.py` verifies async HTTP fetching, URL-safe image identifiers, error translation, and process-wide concurrency limiting. |
+| Relevance filtering is CPU-intensive and swappable | `app/ports/relevance.py` defines the ranker Protocol. `tests/unit/test_relevance_cpu.py` proves the concrete ranker dispatches work through a `ProcessPoolExecutor`; `tests/unit/test_relevance_fake.py` covers the deterministic fake used in fast unit tests. |
+| Core service does not depend on concrete clients | `tests/unit/test_ports.py` and `tests/unit/test_deps.py` verify the Protocol/fake wiring. The orchestrator tests use only the `Ports` bundle, not HTTP implementations. |
+| Correct end-to-end flow: stream → filter → fetch → rank → QA | `tests/unit/test_orchestrator.py` covers the core pipeline, empty-window short-circuit, `[from, to)` boundary behavior, sorted-stream assumption, partial-failure threshold, sampling before fetch, order preservation, and concurrency bounds. |
+| Workflow `/qa/answer` receives ranked image identifiers | `tests/unit/test_workflow_http.py` verifies the POST body. `tests/unit/test_orchestrator.py::TestOrderPreservation` verifies ranker order is passed to QA unchanged. |
+| Observability is appropriate for production-style debugging | `tests/unit/test_obs_middleware.py`, `tests/unit/test_obs_logging.py`, `tests/unit/test_obs_tracing.py`, and `tests/unit/test_orchestrator_spans.py` cover request-id propagation, structured logs, tracing configuration, and manual pipeline spans. |
+| The stack can be tested without external paid services | `tests/integration/test_end_to_end.py` runs the app with in-process ASGI mocks. `tests/integration/test_live_stack.py` starts the app and both mock services as real `uvicorn` subprocesses over TCP. |
+| Quality gates are reproducible by reviewers | `make test`, `make test-cov`, `make lint`, and `make typecheck` are the reviewer entry points. The coverage gate is configured at 93% branch coverage. |
+
+The latest local verification before submission was:
+
+```text
+make test       -> 326 passed
+make test-cov   -> 326 passed, 99.59% coverage
+make lint       -> ruff + flake8 passed
+make typecheck  -> mypy passed
+```
+
+## Submission Notes
+
+Approximate time spent: about 3 hours of implementation time, plus additional
+review and hardening passes using LLM-assisted critique.
+
+With more time, I would replace the deterministic fake relevance ranker with a
+real image/text relevance model or embedding pipeline, add production metrics
+and dashboards, introduce health/readiness probes for the process pool and
+upstream dependencies, add retry/circuit-breaker policies around Workflow and
+Storage calls, containerise the service, and run load tests for burst traffic
+and large screenshot windows.
+
+Feedback on the challenge: the brief is realistic and well-scoped for showing
+async Python, clean boundaries, testability, and production judgment. The
+intentionally ambiguous areas — response shape, observability, mocking strategy,
+and partial-failure policy — are useful because they reveal engineering
+tradeoffs rather than only framework familiarity. The main improvement I would
+suggest is clarifying whether the Workflow stream is finite and timestamp-sorted
+or whether the service should pass time-window filters upstream; that one
+assumption has a large impact on correctness and resource usage.
 
 ## Observability
 
