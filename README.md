@@ -39,8 +39,8 @@ POST /enriched-qa
             └── workflow.qa_answer — QA call with ranked ids
 ```
 
-For a full design walkthrough see [architect.md](architect.md). The
-phase-by-phase decision log lives in [PHASE_NOTES.md](PHASE_NOTES.md).
+For a full design walkthrough see [architect.md](2_architect.md). The
+phase-by-phase decision log lives in [PHASE_NOTES.md](4_implementation_notes.md).
 
 ## Quickstart
 
