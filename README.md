@@ -9,7 +9,7 @@ within a single request lifetime.
 
 ## [architectecture_diagram](docs/2_architecture_diagram.excalidraw)
 
-![img.png](img.png)
+![img.png](architecture_diagram.png)
 
 ## Quickstart
 
@@ -40,32 +40,7 @@ Then POST to `/enriched-qa`. The payload below is the exact example
 from the assignment brief (`docs/1_assignment.md`) and is also the
 default pre-filled in Swagger at <http://localhost:8000/docs>:
 
-```bash
-curl -s -X POST http://localhost:8000/enriched-qa \
-  -H 'Content-Type: application/json' \
-  -d '{
-        "project_id":"8b80353b-aee6-4835-ba7e-c3b79010bc0b",
-        "from":1754037000,
-        "to":1754039000,
-        "question":"What car license plates are being looked at?"
-      }' | jq .
-```
-
-Expected `200 OK`:
-
-```json
-{
-  "answer": "Q: What car license plates are being looked at? | IDs: img-005.png,img-006.png,...",
-  "meta": {
-    "request_id": "<uuid>",
-    "images_considered": 10,
-    "images_relevant": 10,
-    "errors": {},
-    "latency_ms": {"stream": 21, "fetch": 14, "rank": 0, "qa": 1, "total": 37},
-    "relevant_image_ids": ["img-005.png", "img-006.png", "..."]
-  }
-}
-```
+![img_1.png](live_test.png)
 
 The mock workflow QA endpoint echoes the question and the ranked image
 ids verbatim so a reviewer can verify the ranker's output order
