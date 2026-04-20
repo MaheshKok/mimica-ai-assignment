@@ -111,6 +111,21 @@ class TestMeta:
         meta = Meta(request_id="r1", images_considered=0, images_relevant=0)
         assert meta.latency_ms == {}
 
+    def test_default_relevant_image_ids_is_empty_list(self) -> None:
+        meta = Meta(request_id="r1", images_considered=0, images_relevant=0)
+        assert meta.relevant_image_ids == []
+
+    def test_preserves_relevant_image_ids_order(self) -> None:
+        # Order matters: the service's contract is to forward ranker output
+        # to the QA endpoint unchanged, and this field mirrors that payload.
+        meta = Meta(
+            request_id="r1",
+            images_considered=3,
+            images_relevant=3,
+            relevant_image_ids=["z.png", "a.png", "m.png"],
+        )
+        assert meta.relevant_image_ids == ["z.png", "a.png", "m.png"]
+
     def test_rejects_negative_images_considered(self) -> None:
         with pytest.raises(ValidationError):
             Meta(request_id="r1", images_considered=-1, images_relevant=0)

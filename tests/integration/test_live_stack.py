@@ -267,8 +267,11 @@ async def test_live_stack_returns_200_via_real_sockets(
     """
     body = {
         "project_id": str(uuid4()),
-        "from": 1_700_000_000,
-        "to": 1_700_001_000,
+        # Window covers the mock's DEFAULT_REFS epoch (see
+        # mock_services/workflow_api/app.py). Keeps this test
+        # independent from Swagger's pre-filled example payload.
+        "from": 1_754_037_000,
+        "to": 1_754_037_000 + 1000,
         "question": "what is happening?",
     }
     async with httpx.AsyncClient(timeout=20.0) as client:
@@ -325,8 +328,10 @@ async def test_live_stack_emits_structured_log_with_request_id(
         pinned = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         body = {
             "project_id": str(uuid4()),
-            "from": 1_700_000_000,
-            "to": 1_700_001_000,
+            # Matches mock_services/workflow_api/app.py::DEFAULT_REFS so
+            # the orchestrator reaches the logging paths we assert on.
+            "from": 1_754_037_000,
+            "to": 1_754_037_000 + 1000,
             "question": "gate",
         }
         async with httpx.AsyncClient(timeout=20.0) as client:

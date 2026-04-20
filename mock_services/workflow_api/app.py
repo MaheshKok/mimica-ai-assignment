@@ -33,9 +33,12 @@ if TYPE_CHECKING:
 
 
 # Default refs used by ``make run-mocks``. Ten rows, 30 seconds apart,
-# starting at an arbitrary epoch. Tests override this via create_app.
+# starting at the epoch used by the assignment's example request body
+# (``docs/1_assignment.md`` - ``from: 1754037000``) so Swagger's
+# Try-It-Out payload lands inside the mock stream without any edits.
+# Tests override this via ``create_app`` when they need other values.
 DEFAULT_REFS: tuple[dict[str, object], ...] = tuple(
-    {"timestamp": 1_700_000_000 + i * 30, "screenshot_url": f"img-{i:03d}.png"} for i in range(10)
+    {"timestamp": 1_754_037_000 + i * 30, "screenshot_url": f"img-{i:03d}.png"} for i in range(10)
 )
 
 

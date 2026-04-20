@@ -118,8 +118,10 @@ async def _post(
 def _body(
     *,
     project_id: str | None = None,
-    from_: int = 1_700_000_000,
-    to: int = 1_700_001_000,
+    # Defaults match mock_services.workflow_api.app::DEFAULT_REFS so
+    # the happy-path tests see all 10 refs without any edits.
+    from_: int = 1_754_037_000,
+    to: int = 1_754_037_000 + 1000,
     question: str = "what is happening?",
 ) -> dict[str, object]:
     return {
@@ -142,7 +144,8 @@ class TestHappyPath:
         assert r.status_code == 200, r.text
         data = r.json()
         # Default workflow ships 10 refs at 30s intervals starting at
-        # 1_700_000_000; our 1000s window captures all of them.
+        # 1_754_037_000 (the assignment's canonical epoch); our 1000s
+        # window captures all of them.
         assert data["meta"]["images_considered"] == 10
         assert data["meta"]["images_relevant"] == 10
         assert data["meta"]["errors"] == {}
@@ -160,6 +163,7 @@ class TestHappyPath:
             "images_relevant",
             "errors",
             "latency_ms",
+            "relevant_image_ids",
         }
 
 
@@ -181,12 +185,12 @@ class TestEncodedImageIds:
 
     async def test_ids_with_reserved_chars_round_trip(self) -> None:
         tricky = [
-            {"timestamp": 1_700_000_000, "screenshot_url": "a/b.png"},
-            {"timestamp": 1_700_000_030, "screenshot_url": "img.png?token=x"},
-            {"timestamp": 1_700_000_060, "screenshot_url": "with space.png"},
-            {"timestamp": 1_700_000_090, "screenshot_url": "a+b&c.png"},
-            {"timestamp": 1_700_000_120, "screenshot_url": "图-1.png"},
-            {"timestamp": 1_700_000_150, "screenshot_url": "normal.png"},
+            {"timestamp": 1_754_037_000, "screenshot_url": "a/b.png"},
+            {"timestamp": 1_754_037_030, "screenshot_url": "img.png?token=x"},
+            {"timestamp": 1_754_037_060, "screenshot_url": "with space.png"},
+            {"timestamp": 1_754_037_090, "screenshot_url": "a+b&c.png"},
+            {"timestamp": 1_754_037_120, "screenshot_url": "图-1.png"},
+            {"timestamp": 1_754_037_150, "screenshot_url": "normal.png"},
         ]
         workflow_mock = create_workflow_app(refs=tricky)
         r = await _post(workflow_mock, _body())
@@ -218,7 +222,7 @@ class TestPartialFailure:
         # 20% default threshold. Request succeeds with meta.errors
         # populated.
         refs = [
-            {"timestamp": 1_700_000_000 + i * 30, "screenshot_url": f"img-{i:03d}.png"}
+            {"timestamp": 1_754_037_000 + i * 30, "screenshot_url": f"img-{i:03d}.png"}
             for i in range(10)
         ]
         refs[0]["screenshot_url"] = "missing-abc.png"
@@ -235,7 +239,7 @@ class TestPartialFailure:
         # 10 refs, 5 missing -> 50% failure, well above 20%.
         refs = [
             {
-                "timestamp": 1_700_000_000 + i * 30,
+                "timestamp": 1_754_037_000 + i * 30,
                 "screenshot_url": (f"missing-{i:03d}.png" if i < 5 else f"img-{i:03d}.png"),
             }
             for i in range(10)
@@ -262,15 +266,15 @@ class TestStreamSortedAssumption:
         # the mock a ref list where out-of-order refs are interleaved
         # with in-window ones, and set assume_sorted_stream=False.
         refs = [
-            {"timestamp": 1_700_005_000, "screenshot_url": "past-1.png"},  # past the `to`
-            {"timestamp": 1_700_000_000, "screenshot_url": "in-1.png"},
-            {"timestamp": 1_700_010_000, "screenshot_url": "past-2.png"},
-            {"timestamp": 1_700_000_030, "screenshot_url": "in-2.png"},
+            {"timestamp": 1_754_042_000, "screenshot_url": "past-1.png"},  # past the `to`
+            {"timestamp": 1_754_037_000, "screenshot_url": "in-1.png"},
+            {"timestamp": 1_754_047_000, "screenshot_url": "past-2.png"},
+            {"timestamp": 1_754_037_030, "screenshot_url": "in-2.png"},
         ]
         workflow_mock = create_workflow_app(refs=refs)
         r = await _post(
             workflow_mock,
-            _body(to=1_700_000_100),  # 100s window
+            _body(to=1_754_037_100),  # 100s window
             settings=_settings(assume_sorted_stream=False),
         )
         assert r.status_code == 200, r.text
@@ -289,7 +293,7 @@ class TestOrderPreservation:
         # deterministic for fixed inputs. QA mock echoes what it
         # received. Therefore the order in the final answer must
         # reflect the ranker's deterministic order.
-        refs = [{"timestamp": 1_700_000_000 + i, "screenshot_url": f"id-{i}.png"} for i in range(5)]
+        refs = [{"timestamp": 1_754_037_000 + i, "screenshot_url": f"id-{i}.png"} for i in range(5)]
         workflow_mock = create_workflow_app(refs=refs)
         r1 = await _post(workflow_mock, _body(question="same-q"))
         r2 = await _post(workflow_mock, _body(question="same-q"))

@@ -36,16 +36,18 @@ make run-mocks
 make run
 ```
 
-Then POST to `/enriched-qa`:
+Then POST to `/enriched-qa`. The payload below is the exact example
+from the assignment brief (`docs/1_assignment.md`) and is also the
+default pre-filled in Swagger at <http://localhost:8000/docs>:
 
 ```bash
 curl -s -X POST http://localhost:8000/enriched-qa \
   -H 'Content-Type: application/json' \
   -d '{
-        "project_id":"00000000-0000-0000-0000-000000000001",
-        "from":1700000000,
-        "to":1700001000,
-        "question":"what is happening?"
+        "project_id":"8b80353b-aee6-4835-ba7e-c3b79010bc0b",
+        "from":1754037000,
+        "to":1754039000,
+        "question":"What car license plates are being looked at?"
       }' | jq .
 ```
 
@@ -53,16 +55,34 @@ Expected `200 OK`:
 
 ```json
 {
-  "answer": "Q: what is happening? | IDs: img-005.png,img-006.png,...",
+  "answer": "Q: What car license plates are being looked at? | IDs: img-005.png,img-006.png,...",
   "meta": {
     "request_id": "<uuid>",
     "images_considered": 10,
     "images_relevant": 10,
     "errors": {},
-    "latency_ms": {"stream": 21, "fetch": 14, "rank": 0, "qa": 1, "total": 37}
+    "latency_ms": {"stream": 21, "fetch": 14, "rank": 0, "qa": 1, "total": 37},
+    "relevant_image_ids": ["img-005.png", "img-006.png", "..."]
   }
 }
 ```
+
+The mock workflow QA endpoint echoes the question and the ranked image
+ids verbatim so a reviewer can verify the ranker's output order
+end-to-end. A real QA backend would return a natural-language answer
+in the same `answer` field — the orchestrator passes it through
+unchanged. `meta.relevant_image_ids` exposes the ranker's selection as
+a machine-parseable list so clients don't have to parse the free-form
+`answer` to recover it.
+
+### Swagger UI
+
+FastAPI's interactive docs are available at
+<http://localhost:8000/docs> while the service is running. The
+`POST /enriched-qa` operation pre-fills the Try-It-Out body with the
+assignment's canonical payload, so a reviewer can click **Try it
+out → Execute** and land inside the mock stream with no edits.
+ReDoc is also served at <http://localhost:8000/redoc>.
 
 The upstream URLs are configurable via `WORKFLOW_API_URL` and
 `STORAGE_BASE_URL` — see `.env.example`. Mock ports can be overridden via

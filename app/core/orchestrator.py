@@ -138,6 +138,7 @@ async def run(
                         images_relevant=0,
                         errors={},
                         latency_ms=latency,
+                        relevant_image_ids=[],
                     ),
                 )
 
@@ -214,6 +215,7 @@ async def run(
                     images_relevant=len(relevant_ids),
                     errors=errors,
                     latency_ms=latency,
+                    relevant_image_ids=relevant_ids,
                 ),
             )
 

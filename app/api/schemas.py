@@ -33,7 +33,21 @@ class EnrichedQARequest(BaseModel):
         question: Natural-language question, 1-1024 characters.
     """
 
-    model_config = ConfigDict(populate_by_name=True)
+    # The ``json_schema_extra`` example is what Swagger's "Try it out"
+    # panel pre-fills. Using the assignment brief's canonical payload
+    # (docs/1_assignment.md) means hitting Execute with no edits lands
+    # inside the mock stream and produces the license-plate answer.
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_schema_extra={
+            "example": {
+                "project_id": "8b80353b-aee6-4835-ba7e-c3b79010bc0b",
+                "from": 1754037000,
+                "to": 1754039000,
+                "question": "What car license plates are being looked at?",
+            }
+        },
+    )
 
     project_id: UUID
     from_: int = Field(alias="from", ge=0)
@@ -51,8 +65,8 @@ class EnrichedQARequest(BaseModel):
 class Meta(BaseModel):
     """Metadata attached to every successful response.
 
-    Counts are non-negative integers. Default-empty dicts let handlers and
-    the orchestrator populate only the keys they have data for.
+    Counts are non-negative integers. Default-empty containers let handlers
+    and the orchestrator populate only the keys they have data for.
 
     Attributes:
         request_id: Correlation id for logs, spans, and clients.
@@ -62,6 +76,11 @@ class Meta(BaseModel):
             Upper-bounded by the ranker's ``top_k``.
         errors: Per-kind failure counts, e.g. ``{"storage_fetch_failed": 3}``.
         latency_ms: Wall-clock timing per stage, e.g. ``{"total": 940}``.
+        relevant_image_ids: The ranker's output, in rank order, as a
+            machine-parseable list. Mirrors what was POSTed to the upstream
+            ``/qa/answer`` endpoint so clients can inspect the ranker's
+            selection without parsing the free-form ``answer`` string.
+            Empty for empty-window requests.
     """
 
     request_id: str
@@ -69,6 +88,7 @@ class Meta(BaseModel):
     images_relevant: NonNegativeInt
     errors: dict[str, NonNegativeInt] = Field(default_factory=dict)
     latency_ms: dict[str, NonNegativeInt] = Field(default_factory=dict)
+    relevant_image_ids: list[str] = Field(default_factory=list)
 
 
 class EnrichedQAResponse(BaseModel):
