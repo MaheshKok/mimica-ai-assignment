@@ -9,7 +9,7 @@ within a single request lifetime.
 
 ## [architectecture_diagram](docs/2_architecture_diagram.excalidraw)
 
-![img.png](architecture_diagram.png)
+![img.png](images/architecture_diagram.png)
 
 ## Quickstart
 
@@ -40,7 +40,7 @@ Then POST to `/enriched-qa`. The payload below is the exact example
 from the assignment brief (`docs/1_assignment.md`) and is also the
 default pre-filled in Swagger at <http://localhost:8000/docs>:
 
-![img_1.png](live_test.png)
+![img_1.png](images/live_test.png)
 
 The mock workflow QA endpoint echoes the question and the ranked image
 ids verbatim so a reviewer can verify the ranker's output order
