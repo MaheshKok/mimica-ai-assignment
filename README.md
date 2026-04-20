@@ -1,49 +1,71 @@
 # Enriched QA Service
 
-Async REST service that enriches a QA endpoint with relevant screenshots from a
-project time window.
+Async REST service that enriches a question-answering endpoint with relevant
+screenshots sourced from a project's time window. The service streams image
+references from an upstream workflow API, fetches the associated binary data
+from object storage in parallel, ranks them for relevance using a CPU-bound
+worker pool, and forwards the shortlisted identifiers to a QA backend — all
+within a single request lifetime.
 
-> **Current state: Phase 7 complete.** Observability is live end-to-end.
-> Every request is stamped with an `X-Request-Id` (honouring inbound headers or
-> minting a UUID4), bound to `structlog` contextvars, and set as an attribute
-> on the current OpenTelemetry span. The orchestrator emits five manual spans
-> (`enriched_qa.handler`, `workflow.stream`, `storage.fetch_batch`,
-> `relevance.rank`, `workflow.qa_answer`) nested under the auto-instrumented
-> FastAPI server span, with `httpx` client spans auto-attached for every
-> upstream call. Spans export to `OTEL_EXPORTER_OTLP_ENDPOINT` when set, or to
-> stdout only when `TRACE_CONSOLE=true`; otherwise spans are discarded so stdout
-> stays JSON-log-only. Logs are JSON-rendered with timestamp, level, event, and
-> bound `request_id`. The relevance ranker still
-> runs on a lifespan-owned `ProcessPoolExecutor` from Phase 6; broken or
-> shut-down pools surface as HTTP 503 (`relevance_ranker_unavailable`).
-> Architecture lives in [architect.md](architect.md); phase-by-phase execution
-> in [plan.md](plan.md); per-phase decision log in [PHASE_NOTES.md](PHASE_NOTES.md).
+## Features
 
-## Quickstart (evaluators)
+- **Request correlation** — inbound `X-Request-Id` is honoured or a UUID4 is
+  minted; the id propagates through response headers, the response body, every
+  log line, and the active OpenTelemetry span.
+- **Structured logging** — all output is newline-delimited JSON
+  (`event`, `level`, `timestamp`, `request_id`, plus any handler-bound fields).
+  Stdlib loggers (uvicorn, httpx) are routed through the same structlog
+  pipeline so no log line is plain text.
+- **Distributed tracing** — five manual spans (`enriched_qa.handler`,
+  `workflow.stream`, `storage.fetch_batch`, `relevance.rank`,
+  `workflow.qa_answer`) nest under the auto-instrumented FastAPI server span;
+  `httpx` client spans are attached automatically for every upstream call.
+- **Process-pool ranker** — relevance ranking runs on a
+  lifespan-managed `ProcessPoolExecutor` to keep the async event loop free;
+  pool failure surfaces as HTTP 503 (`relevance_ranker_unavailable`).
+- **Graceful error envelopes** — all error responses share a consistent shape
+  (`error`, `detail`, `request_id`) and timeouts, upstream failures, and
+  validation errors each map to a distinct error code.
+
+## Architecture
+
+```
+POST /enriched-qa
+    └── RequestIdMiddleware (bind request_id)
+        └── enriched_qa.handler span
+            ├── workflow.stream   — SSE stream of image refs
+            ├── storage.fetch_batch — parallel binary fetches
+            ├── relevance.rank   — CPU-bound worker pool
+            └── workflow.qa_answer — QA call with ranked ids
+```
+
+For a full design walkthrough see [architect.md](architect.md). The
+phase-by-phase decision log lives in [PHASE_NOTES.md](PHASE_NOTES.md).
+
+## Quickstart
+
+Python 3.12 required. Dependencies are managed with
+[`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-make install   # uv sync - installs all dependencies
+make install   # uv sync — installs all dependencies
 make test      # run pytest (all suites)
 make test-cov  # run pytest with 93% coverage gate
 make lint      # ruff + flake8
 make typecheck # mypy strict
 ```
 
-Python 3.12 required. Dependencies are managed with
-[`uv`](https://docs.astral.sh/uv/). `make install` does **not** install git
-hooks, so it works from a zipped submission without a `.git` directory.
+`make install` does not install git hooks, so it works from a zipped
+submission without a `.git` directory.
 
 ## Running the live stack
 
-Two terminals:
-
 ```bash
-# terminal 1 — starts both mocks with PID tracking, readiness probes,
-# and fail-fast cleanup. Ctrl-C stops both.
-make run-mocks    # workflow :9000, storage :9100
+# Terminal 1 — workflow mock (:9000) and storage mock (:9100)
+make run-mocks
 
-# terminal 2 — starts the real service
-make run          # :8000
+# Terminal 2 — the enriched-qa service (:8000)
+make run
 ```
 
 Then POST to `/enriched-qa`:
@@ -59,7 +81,7 @@ curl -s -X POST http://localhost:8000/enriched-qa \
       }' | jq .
 ```
 
-Expected `200 OK` response:
+Expected `200 OK`:
 
 ```json
 {
@@ -74,16 +96,13 @@ Expected `200 OK` response:
 }
 ```
 
-The target URLs are configurable via `WORKFLOW_API_URL` and `STORAGE_BASE_URL`
-— see `.env.example` — so you can point the service at any compatible
-deployment. The mock ports can be overridden via `WORKFLOW_PORT` /
-`STORAGE_PORT` env vars before `make run-mocks`.
+The upstream URLs are configurable via `WORKFLOW_API_URL` and
+`STORAGE_BASE_URL` — see `.env.example`. Mock ports can be overridden via
+`WORKFLOW_PORT` / `STORAGE_PORT` before `make run-mocks`.
 
 ### Troubleshooting: mocks not running
 
-If you hit `make run` without `make run-mocks` first, the HTTP adapters cannot
-reach the upstream and every request returns a **502 `workflow_upstream_failure`**
-envelope:
+Running the app without the mocks produces a **502 `workflow_upstream_failure`**:
 
 ```json
 {
@@ -93,60 +112,64 @@ envelope:
 }
 ```
 
-Seeing this shape means the route timeout, `request_id` correlation, and error
-envelope are all wired correctly — only the upstream is absent. Start
-`make run-mocks` in a second terminal and retry.
+This shape confirms that routing, request-id correlation, and the error envelope
+are all wired correctly — only the upstream is absent. Start `make run-mocks`
+and retry.
 
 ## Testing
 
 ```bash
-make test       # full suite; ASGITransport integration + one live-socket test
+make test       # full suite
 make test-cov   # same, with the 93% branch-coverage gate enforced
-
-uv run pytest tests/unit/test_orchestrator.py -v         # core pipeline
-uv run pytest tests/unit/test_workflow_http.py -v        # HTTP adapter (httpx.MockTransport)
-uv run pytest tests/unit/test_storage_http.py -v         # HTTP adapter (httpx.MockTransport)
-uv run pytest tests/unit/test_routes.py -v               # FastAPI wire-up via overrides
-uv run pytest tests/unit/test_boundary_contracts.py      # timeout, request-id, sanitisation
-uv run pytest tests/integration/test_end_to_end.py       # component-level, ASGITransport
-uv run pytest tests/integration/test_live_stack.py       # real sockets + subprocess mocks
 ```
 
-The integration suite is split into two layers. `test_end_to_end.py` uses
-`httpx.ASGITransport` for fast component-level coverage of encoding,
-partial-failure handling, and order preservation. `test_live_stack.py` spawns
-the mocks and the app as real `uvicorn` subprocesses on ephemeral ports and
-exercises the full production wiring — shared `httpx.AsyncClient` lifespan,
-`build_http_ports`, and TCP between every hop. One case in the live stack
-pipes app stdout to a file and asserts a JSON log line appears carrying the
-inbound `X-Request-Id`, proving the observability pipeline is fully wired.
+Run individual layers:
+
+```bash
+uv run pytest tests/unit/test_orchestrator.py -v       # core pipeline
+uv run pytest tests/unit/test_workflow_http.py -v      # HTTP adapter
+uv run pytest tests/unit/test_storage_http.py -v       # HTTP adapter
+uv run pytest tests/unit/test_routes.py -v             # FastAPI wire-up
+uv run pytest tests/unit/test_boundary_contracts.py    # timeout, request-id, sanitisation
+uv run pytest tests/integration/test_end_to_end.py     # component-level, ASGITransport
+uv run pytest tests/integration/test_live_stack.py     # real sockets + subprocess mocks
+```
+
+The integration suite has two layers:
+
+- `test_end_to_end.py` uses `httpx.ASGITransport` for fast component-level
+  coverage of encoding, partial-failure handling, and order preservation.
+- `test_live_stack.py` spawns the mocks and the app as real `uvicorn`
+  subprocesses on ephemeral ports, exercising the full production wiring —
+  shared `httpx.AsyncClient` lifespan, `build_http_ports`, and TCP between
+  every hop. One case pipes app stdout to a file and asserts a JSON log line
+  carrying the inbound `X-Request-Id` is present, proving the observability
+  pipeline is wired end-to-end.
 
 ## Observability
 
-Set `OTEL_EXPORTER_OTLP_ENDPOINT=https://your-collector:4317` to ship spans
-over OTLP/gRPC. For local span debugging without a collector, set
-`TRACE_CONSOLE=true` and spans stream to stdout via the console exporter. With
-both unset/false, spans use a no-op exporter so stdout stays a clean JSON log
-stream. The service name on every resource is `enriched-qa-service`.
+| Config | Effect |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT=https://collector:4317` | Ship spans over OTLP/gRPC |
+| `TRACE_CONSOLE=true` | Print spans to stdout (console exporter) |
+| Neither set | No-op exporter; stdout is JSON logs only |
 
-- **Request correlation**: the service honours an inbound `X-Request-Id`
-  header (empty and whitespace-only values are ignored), otherwise mints a
-  UUID4. The id is echoed in the response header, stamped on the response
-  body's `meta.request_id` (and on any error envelope), bound to every log
-  line emitted during the request, and set as the `request_id` attribute on
-  the current OTel span.
-- **Spans**: five manual spans — `enriched_qa.handler`, `workflow.stream`,
-  `storage.fetch_batch`, `relevance.rank`, `workflow.qa_answer` — nest under
-  the auto-instrumented FastAPI server span. `httpx` client spans are
-  attached automatically for every upstream call.
-- **Logs**: structured JSON, one object per line — `event`, `level`,
-  `timestamp` (ISO-8601 UTC), plus any bound contextvars and handler-supplied
-  fields. Uvicorn's access log flows through the same stdout.
+The service name on every OTel resource is `enriched-qa-service`.
 
-## Contributors
+**Spans** — five manual spans nest under the auto-instrumented FastAPI server
+span. Each span carries `project_id`, `images_considered`, `images_relevant`,
+and `fetches.failed` as attributes, populated eagerly so dashboards see counts
+even when a request fails mid-pipeline.
 
-If you're working in a cloned repo and want the local commit-time guardrails:
+**Logs** — one JSON object per line: `event`, `level`, `timestamp` (ISO-8601
+UTC), plus bound contextvars and any handler-supplied fields. Stdlib loggers
+from uvicorn and httpx are routed through the same structlog pipeline via
+`ProcessorFormatter`, so no log line bypasses request-id correlation.
+
+## Contributing
+
+To enable commit-time guardrails in a cloned repo:
 
 ```bash
-make hooks     # installs pre-commit hooks - no-op if .git is absent
+make hooks   # installs pre-commit hooks — no-op if .git is absent
 ```
