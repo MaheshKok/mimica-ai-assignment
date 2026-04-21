@@ -1,0 +1,36 @@
+services:
+  app:
+    container_name: mimicaai-app
+    build:
+      context: .
+    command: ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      WORKFLOW_API_URL: http://workflow-mock:9000
+      STORAGE_BASE_URL: http://storage-mock:9100
+    depends_on:
+      - workflow-mock
+      - storage-mock
+    ports:
+      - "8000:8000"
+
+  workflow-mock:
+    container_name: mimicaai-workflow-mock
+    build:
+      context: .
+    command: ["uv", "run", "python", "-m", "mock_services.workflow_api"]
+    environment:
+      WORKFLOW_HOST: 0.0.0.0
+      WORKFLOW_PORT: "9000"
+    ports:
+      - "9000:9000"
+
+  storage-mock:
+    container_name: mimicaai-storage-mock
+    build:
+      context: .
+    command: ["uv", "run", "python", "-m", "mock_services.storage_api"]
+    environment:
+      STORAGE_HOST: 0.0.0.0
+      STORAGE_PORT: "9100"
+    ports:
+      - "9100:9100"

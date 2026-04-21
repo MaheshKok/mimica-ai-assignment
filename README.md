@@ -23,12 +23,50 @@ git clone <github-repository-url>
 cd mimicaai-assignment
 ```
 
+### Option 1: local setup with `uv`
+
+Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/) first,
+then run:
+
+```bash
+make install   # uv sync — installs all dependencies into .venv
+```
+
+You do not need to create or activate a virtual environment manually; `uv`
+creates the project-local `.venv` automatically. If you prefer not to activate
+it, every project command already uses `uv run ...` through the Makefile.
+
+### Option 2: containerized setup with Docker Compose
+
+If you want a toolchain-independent path, build and run the full stack with
+Docker:
+
+```bash
+docker compose up --build
+```
+
+This starts:
+
+- the app on <http://localhost:8000>
+- the workflow mock on <http://localhost:9000>
+- the storage mock on <http://localhost:9100>
+
+Compose also assigns explicit container names so the running stack is easy to
+inspect:
+
+- `mimicaai-app`
+- `mimicaai-workflow-mock`
+- `mimicaai-storage-mock`
+
+You can stop the stack with:
+
+```bash
+docker compose down
+```
 
 ## Running the live stack
 
 ```bash
-make install   # uv sync — installs all dependencies
-
 # Terminal 1 — workflow mock (:9000) and storage mock (:9100)
 make run-mocks
 
@@ -77,6 +115,7 @@ The upstream URLs are configurable via `WORKFLOW_API_URL` and
 | Workflow `/qa/answer` receives ranked image identifiers | `tests/unit/test_workflow_http.py` verifies the POST body. `tests/unit/test_orchestrator.py::TestOrderPreservation` verifies ranker order is passed to QA unchanged. |
 | Observability is appropriate for production-style debugging | `tests/unit/test_obs_middleware.py`, `tests/unit/test_obs_logging.py`, `tests/unit/test_obs_tracing.py`, and `tests/unit/test_orchestrator_spans.py` cover request-id propagation, structured logs, tracing configuration, and manual pipeline spans. |
 | The stack can be tested without external paid services | `tests/integration/test_end_to_end.py` runs the app with in-process ASGI mocks. `tests/integration/test_live_stack.py` starts the app and both mock services as real `uvicorn` subprocesses over TCP. |
+| Reviewers can run the stack without local Python toolchain setup | Root `Dockerfile` and `compose.yaml` provide a containerized app + mock stack on ports `8000`, `9000`, and `9100`. `tests/unit/test_container_files.py` guards the presence and wiring of those container artifacts. |
 | Quality gates are reproducible by reviewers | `make test`, `make test-cov`, `make lint`, and `make typecheck` are the reviewer entry points. The coverage gate is configured at 93% branch coverage. |
 
 
@@ -111,6 +150,7 @@ uv run pytest tests/unit/test_workflow_http.py -v      # HTTP adapter
 uv run pytest tests/unit/test_storage_http.py -v       # HTTP adapter
 uv run pytest tests/unit/test_routes.py -v             # FastAPI wire-up
 uv run pytest tests/unit/test_boundary_contracts.py    # timeout, request-id, sanitisation
+uv run pytest tests/unit/test_container_files.py       # Dockerfile + compose regression checks
 uv run pytest tests/integration/test_end_to_end.py     # component-level, ASGITransport
 uv run pytest tests/integration/test_live_stack.py     # real sockets + subprocess mocks
 ```
@@ -129,8 +169,8 @@ The integration suite has two layers:
 The latest local verification before submission was:
 
 ```text
-make test       -> 326 passed
-make test-cov   -> 326 passed, 99.59% coverage
+make test       -> 334 passed
+make test-cov   -> 334 passed, 99.59% coverage
 make lint       -> ruff + flake8 passed
 make typecheck  -> mypy passed
 ```

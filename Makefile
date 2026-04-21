@@ -1,7 +1,7 @@
 # Makefile targets for the Enriched QA Service.
 # All targets assume `uv` is installed. Run `make help` for a list.
 
-.PHONY: help install sync run run-mocks test test-cov lint format typecheck hooks clean
+.PHONY: help install sync run run-mocks docker-build docker-up docker-down test test-cov lint format typecheck hooks clean
 
 help:  ## Show this help.
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -16,6 +16,15 @@ run:  ## Run the FastAPI service on :8000 (reads .env; reload enabled).
 
 run-mocks:  ## Run both mock services with PID tracking, readiness probes, and fail-fast cleanup.
 	@bash scripts/run_mocks.sh
+
+docker-build:  ## Build the app and mock images defined in compose.yaml.
+	docker compose build
+
+docker-up:  ## Start the app and both mocks via Docker Compose.
+	docker compose up --build
+
+docker-down:  ## Stop the Docker Compose stack.
+	docker compose down
 
 test:  ## Run the test suite (without coverage gate).
 	uv run pytest
